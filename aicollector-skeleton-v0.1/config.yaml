@@ -1,0 +1,42 @@
+# AICollector configuration file
+# Default values are shown — override only the keys you need.
+
+server_uuid: null          # Auto-generated on first run if null
+logging_level: INFO
+
+# Retention policies
+retention:
+  history_versions: 50    # Snapshots per collector in history/
+  changes_entries: 200   # Max entries in changes/ (FIFO purge)
+  logs_days: 30           # Days of log retention
+
+# Scheduler
+scheduler:
+  frequency_cron: "0 */2 * * *"   # Every 2 hours (default)
+  use_systemd_timer: false         # Set to true to use systemd timer instead of cron
+
+# Collectors
+collectors:
+  enabled: []           # Empty = all enabled; fill with names to enable only those
+  disabled: []          # Fill with names to disable specific collectors
+  timeout_seconds: 30   # Per-collector timeout
+  parallel: false       # V1.1+ — parallel execution
+  root_required_behavior: skip    # skip | warn | fail
+
+# Security
+security:
+  allowed_commands: []   # Defaults to the hardcoded whitelist in SystemAdapter
+  exclude_paths: []       # Paths never to be read
+  redact_patterns: []     # Additional regex patterns for secret detection
+
+# Paths (FHS — overridden by AICOLLECTOR_ROOT in dev mode)
+paths:
+  base_dir: /var/lib/aicollector
+  config_dir: /etc/aicollector
+  cache_dir: /var/cache/aicollector
+  log_dir: /var/log/aicollector
+  lockfile_path: /run/aicollector/aicollector.lock
+  knowledge_subdir: knowledge
+  history_subdir: history
+  changes_subdir: changes
+  cache_subdir: cache
