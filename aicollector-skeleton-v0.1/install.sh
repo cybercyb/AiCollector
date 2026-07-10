@@ -1,27 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-# install.sh — AICollector installation script (idempotent)
+# install.sh — AICollector installation script (idempotent & hardened)
 #
+# Target OS: Ubuntu Server 26.04 LTS
 # Usage: sudo bash install.sh [--config /path/to/config.yaml] [--dry-run] [--force]
-#
-# Options:
-#   --config <path>  Path to config.yaml (default: ./config.yaml or /etc/aicollector/config.yaml)
-#   --dry-run        Show what would be done without making changes
-#   --force         Continue even if errors occur
-#   --help          Show this help message
-#
-# Behaviour:
-#   • Creates system user 'aicollector'
-#   • Deploys application files to /opt/aicollector/
-#   • Installs dependencies (system packages + Python optional deps)
-#   • Installs auditd ONLY if the 'auditd' collector is active in config.yaml
-#   • Copies configuration file
-#   • Sets up cron or systemd timer scheduling
-#   • Configures logrotate
-#   • Sets correct permissions
-#
-# Idempotence: Safe to run multiple times. Already-configured items are skipped.
-# Requires: Root privileges (sudo)
 # =============================================================================
 
 set -euo pipefail
@@ -34,13 +16,12 @@ LIB_DIR="/var/lib/${APP_NAME}"
 CACHE_DIR="/var/cache/${APP_NAME}"
 LOG_DIR="/var/log/${APP_NAME}"
 RUN_DIR="/run/${APP_NAME}"
-CONFIG_FILE_SOURCE=""       # Path to the config.yaml source (set via --config)
 CONFIG_FILE="${ETC_DIR}/config.yaml"
-LOCKFILE="${RUN_DIR}/${APP_NAME}.lock"
 CRON_MARKER="# AICollector cron"
 UNIT_DIR="/etc/systemd/system"
 DEFAULT_SCHEDULE="0 */2 * * *"  # Every 2 hours
 USER_NAME="${APP_NAME}"
+GROUP_NAME="${APP_NAME}"
 
 # ── Colour helpers ──────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -53,14 +34,14 @@ NC='\033[0m'
 # ── Logging functions ────────────────────────────────────────────────────────────
 log_info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-log_fatal() { echo -e "${RED}[FATAL]${NC} $*"; exit 1; }
+log_fatal() { echo -e "${RED}[FATAL]${NC} $*" >&2; exit 1; }
 log_ok()    { echo -e "${GREEN}[OK]${NC}   $*"; }
 log_dry()   { echo -e "${CYAN}[DRY]${NC}   $*"; }
 log_skip()  { echo -e "${YELLOW}[SKIP]${NC}  $*"; }
 log_step()  {
     local n="$1"; local total="$2"
     echo ""
-    echo -e "${BOLD}=== Step ${n}/${total}: ${*} ===${NC}"
+    echo -e "${BOLD}=== Step ${n}/${total}: ${*:3} ===${NC}"
 }
 
 # ── CLI parsing ────────────────────────────────────────────────────────────────
@@ -72,8 +53,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --config)
             if [[ -z "${2:-}" ]]; then
-                echo "Error: --config requires a path argument"
-                exit 1
+                log_fatal "Error: --config requires a path argument"
             fi
             CUSTOM_CONFIG="$2"
             shift 2
@@ -84,43 +64,45 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: sudo bash $0 [--config /path/to/config.yaml] [--dry-run] [--force]"
             echo ""
             echo "Options:"
-            echo "  --config <path>  Path to config.yaml (default: first ./config.yaml, then /etc/aicollector/config.yaml)"
+            echo "  --config <path>  Path to config.yaml"
             echo "  --dry-run        Show what would be done (no changes)"
-            echo "  --force          Continue even if errors occur"
+            echo "  --force          Continue even if package installation warnings occur"
             echo "  --help           Show this help message"
             exit 0
             ;;
         *)
-            echo "Unknown option: $1"
-            exit 1
+            log_fatal "Unknown option: $1"
             ;;
     esac
 done
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── Helpers & Pre-checks ────────────────────────────────────────────────────────
 require_root() {
     if [[ $EUID -ne 0 ]]; then
         log_fatal "This script must be run as root (use sudo)"
     fi
 }
 
-# Detect whether the 'auditd' collector is active in config.yaml.
-# Logic:
-#   1. Parse collectors.enabled (list of explicitly activated collectors)
-#      - If NON-EMPTY → whitelist mode: auditd active only if explicitly listed
-#   2. Parse collectors.disabled (list of deactivated collectors)
-#      - If auditd appears in disabled → NOT active
-#      - Otherwise → ACTIVE (default: all collectors are active)
+check_disk_space() {
+    # Check that at least 100MB are free in /var/lib (or root if not separated)
+    local target_dir="/var/lib"
+    mkdir -p "${target_dir}"
+    local free_kb
+    free_kb=$(df -P "${target_dir}" | awk 'NR==2 {print $4}')
+    if [[ "${free_kb}" -lt 102400 ]]; then
+        log_fatal "Insufficient disk space: less than 100MB free on ${target_dir}."
+    fi
+}
+
 detect_auditd_active() {
     local config_path="$1"
-    AUDITD_ACTIVE="yes"  # Default: all collectors active
+    AUDITD_ACTIVE="yes"  # Default fallback
 
     if [[ ! -f "${config_path}" ]]; then
         log_warn "config.yaml not found at ${config_path} — assuming auditd collector is ACTIVE"
         return
     fi
 
-    # Use python3 to reliably parse YAML
     if command -v python3 >/dev/null 2>&1; then
         local result
         result=$(python3 -c "
@@ -136,9 +118,9 @@ try:
 except Exception as e:
     print('ERROR:' + str(e), file=sys.stderr)
     sys.exit(1)
-" 2>/dev/null || echo "ERROR|NONE")
+" 2>/dev/null || echo "ERROR")
 
-        if [[ "${result}" == ERROR:* ]]; then
+        if [[ "${result}" == "ERROR" ]]; then
             log_warn "Could not parse config.yaml — assuming auditd collector is ACTIVE"
             return
         fi
@@ -147,7 +129,6 @@ except Exception as e:
         enabled_str=$(echo "${result}" | head -1)
         disabled_str=$(echo "${result}" | tail -1)
 
-        # If enabled list is non-empty → whitelist mode
         if [[ "${enabled_str}" == \[*\] ]] && [[ "${enabled_str}" != "[]" ]]; then
             if echo "${result}" | grep -q "'auditd'"; then
                 AUDITD_ACTIVE="yes"
@@ -155,23 +136,19 @@ except Exception as e:
                 AUDITD_ACTIVE="no"
             fi
         else
-            # Blacklist/default mode: check disabled list
             if [[ "${disabled_str}" == \[*\] ]] && echo "${disabled_str}" | grep -q "'auditd'"; then
                 AUDITD_ACTIVE="no"
             else
                 AUDITD_ACTIVE="yes"
             fi
         fi
-    else
-        log_warn "python3 not available for config parsing — assuming auditd collector is ACTIVE"
     fi
 }
 
 # ── Step 1: Detect config.yaml ─────────────────────────────────────────────────
 install_step1_config() {
-    log_step 1 9 "Locating config.yaml"
+    log_step 1 10 "Locating config.yaml"
 
-    # Priority: 1. --config argument, 2. ./config.yaml (dev), 3. /etc/aicollector/config.yaml
     if [[ -n "${CUSTOM_CONFIG}" ]]; then
         if [[ ! -f "${CUSTOM_CONFIG}" ]]; then
             log_fatal "Custom config file not found: ${CUSTOM_CONFIG}"
@@ -180,47 +157,39 @@ install_step1_config() {
         log_info "Using custom config: ${CUSTOM_CONFIG}"
     elif [[ -f "./config.yaml" ]]; then
         CONFIG_FILE_SOURCE="./config.yaml"
-        log_info "Found ./config.yaml (dev mode) — using as source"
-    elif [[ -f "/etc/aicollector/config.yaml" ]]; then
-        CONFIG_FILE_SOURCE="/etc/aicollector/config.yaml"
-        log_info "Found /etc/aicollector/config.yaml — using as source"
+        log_info "Found ./config.yaml (dev mode source)"
+    elif [[ -f "${CONFIG_FILE}" ]]; then
+        CONFIG_FILE_SOURCE="${CONFIG_FILE}"
+        log_info "Found existing config in production path — preserving"
     else
-        log_warn "No config.yaml found — a default one will be created"
         CONFIG_FILE_SOURCE=""
     fi
 
-    # Detect auditd activation from the config we found
     if [[ -n "${CONFIG_FILE_SOURCE}" ]]; then
         detect_auditd_active "${CONFIG_FILE_SOURCE}"
         if [[ "${AUDITD_ACTIVE}" == "yes" ]]; then
-            log_info "Collecteur 'auditd' is ACTIVE in config — will install auditd package"
+            log_info "Collector 'auditd' is ACTIVE — auditd package installation required"
         else
-            log_warn "Collecteur 'auditd' is DISABLED in config — skipping auditd installation"
+            log_warn "Collector 'auditd' is DISABLED — skipping auditd installation"
         fi
     else
         AUDITD_ACTIVE="yes"
-        log_info "No config found — assuming all collectors active (including auditd)"
+        log_info "No config found — using defaults (all active, including auditd)"
     fi
 }
 
 # ── Step 2: Install system dependencies ────────────────────────────────────────
 install_step2_dependencies() {
-    log_step 2 9 "Installing system dependencies"
+    log_step 2 10 "Installing system dependencies"
 
     if [[ "${DRY_RUN}" == "yes" ]]; then
-        log_dry "Would install: iproute2, smartmontools, openssl, cron, systemd (always)"
-        if [[ "${AUDITD_ACTIVE}" == "yes" ]]; then
-            log_dry "Would install: auditd (conditional — auditd collector is active)"
-        else
-            log_dry "Would SKIP: auditd (auditd collector is disabled in config.yaml)"
-        fi
+        log_dry "Would install: iproute2, smartmontools, openssl, cron, systemd, python3-yaml"
         return 0
     fi
 
-    log_info "Updating package lists..."
-    apt-get update -qq 2>/dev/null || log_warn "apt-get update failed"
+    log_info "Updating packages cache..."
+    apt-get update -qq || log_warn "apt-get update completed with warnings"
 
-    # Always required
     local mandatory_pkgs=(
         "iproute2"
         "smartmontools"
@@ -228,67 +197,81 @@ install_step2_dependencies() {
         "cron"
         "systemd"
         "python3"
-        "python3-pip"
+        "python3-yaml"
     )
 
-    log_info "Installing mandatory packages..."
     local install_status=0
     for pkg in "${mandatory_pkgs[@]}"; do
         if dpkg -s "${pkg}" >/dev/null 2>&1; then
             log_skip "${pkg} already installed"
         else
-            if apt-get install -y -qq "${pkg}" >/dev/null 2>&1; then
+            log_info "Installing: ${pkg}..."
+            if apt-get install -y -qq "${pkg}"; then
                 log_ok "Installed: ${pkg}"
             else
-                log_warn "Failed to install: ${pkg}"
+                log_warn "Failed to install package: ${pkg}"
                 ((install_status++))
             fi
         fi
     done
 
-    # Conditional: auditd only if collector is active
+    # Install auditd only if collector is enabled
     if [[ "${AUDITD_ACTIVE}" == "yes" ]]; then
-        log_info "Installing conditional package: auditd (auditd collector is active)"
         if dpkg -s "auditd" >/dev/null 2>&1; then
-            log_skip "auditd already installed (collector active)"
+            log_skip "auditd already installed"
         else
-            if apt-get install -y -qq "auditd" >/dev/null 2>&1; then
-                log_ok "Installed: auditd (auditd collector is active)"
+            log_info "Installing: auditd..."
+            if apt-get install -y -qq auditd; then
+                log_ok "Installed: auditd"
             else
-                log_warn "Failed to install auditd — auditd collector may not work"
+                log_warn "Failed to install auditd"
                 ((install_status++))
             fi
         fi
     else
-        log_skip "auditd — SKIPPED (auditd collector is DISABLED in config.yaml)"
+        log_skip "auditd (collector 'auditd' disabled in config)"
     fi
 
     if [[ "${install_status}" -gt 0 ]] && [[ "${FORCE}" != "yes" ]]; then
-        log_fatal "Some packages failed to install. Run with --force to ignore errors."
+        log_fatal "Dependency installation failed. Use --force to proceed anyway."
     fi
 }
 
-# ── Step 3: Create system user ─────────────────────────────────────────────────
+# ── Step 3: Create system group & user ─────────────────────────────────────────
 install_step3_user() {
-    log_step 3 9 "Creating system user"
+    log_step 3 10 "Creating dedicated system user and group"
 
-    if id "${USER_NAME}" &>/dev/null; then
-        log_skip "User '${USER_NAME}' already exists"
+    if [[ "${DRY_RUN}" == "yes" ]]; then
+        log_dry "Would verify/create system group: ${GROUP_NAME}"
+        log_dry "Would verify/create system user: ${USER_NAME} belonging to group ${GROUP_NAME}"
+        return 0
+    fi
+
+    # Create Group first
+    if getent group "${GROUP_NAME}" >/dev/null; then
+        log_skip "System group '${GROUP_NAME}' already exists"
     else
-        if [[ "${DRY_RUN}" == "yes" ]]; then
-            log_dry "Would create system user: ${USER_NAME}"
-            return 0
-        fi
-        log_info "Creating system user '${USER_NAME}'..."
-        useradd --system --no-create-home --shell /usr/sbin/nologin "${USER_NAME}" \
-            || { log_warn "Could not create user '${USER_NAME}'"; return 1; }
-        log_ok "User '${USER_NAME}' created"
+        groupadd --system "${GROUP_NAME}"
+        log_ok "System group '${GROUP_NAME}' created successfully"
+    fi
+
+    # Create User
+    if getent passwd "${USER_NAME}" >/dev/null; then
+        log_skip "System user '${USER_NAME}' already exists"
+    else
+        useradd --system \
+                --gid "${GROUP_NAME}" \
+                --no-create-home \
+                --shell /usr/sbin/nologin \
+                --comment "AICollector daemon account" \
+                "${USER_NAME}"
+        log_ok "System user '${USER_NAME}' created successfully"
     fi
 }
 
 # ── Step 4: Create directory structure ──────────────────────────────────────────
 install_step4_directories() {
-    log_step 4 9 "Creating directory structure"
+    log_step 4 10 "Configuring directory layout"
 
     local dirs=(
         "${INSTALL_DIR}"
@@ -304,13 +287,13 @@ install_step4_directories() {
 
     for dir in "${dirs[@]}"; do
         if [[ -d "${dir}" ]]; then
-            log_skip "Directory exists: ${dir}"
+            log_skip "Directory already exists: ${dir}"
         else
             if [[ "${DRY_RUN}" == "yes" ]]; then
-                log_dry "Would create: ${dir}"
+                log_dry "Would create directory: ${dir}"
             else
                 mkdir -p "${dir}"
-                log_ok "Created: ${dir}"
+                log_ok "Created directory: ${dir}"
             fi
         fi
     done
@@ -318,75 +301,63 @@ install_step4_directories() {
 
 # ── Step 5: Deploy application files ───────────────────────────────────────────
 install_step5_deploy() {
-    log_step 5 9 "Deploying application files"
+    log_step 5 10 "Deploying application codebase to /opt"
 
     local script_dir
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
     if [[ "${DRY_RUN}" == "yes" ]]; then
-        log_dry "Would copy application files from ${script_dir} to ${INSTALL_DIR}"
+        log_dry "Would deploy application code to ${INSTALL_DIR}"
         return 0
     fi
 
-    # Find the application root (parent of scripts/)
     local app_root="${script_dir}"
-    if [[ -f "${script_dir}/collector.py" ]]; then
-        app_root="${script_dir}"
-    elif [[ -f "${script_dir}/../collector.py" ]]; then
+    if [[ ! -f "${script_dir}/collector.py" && -f "${script_dir}/../collector.py" ]]; then
         app_root="$(cd "${script_dir}/.." && pwd)"
     fi
 
     if [[ -f "${app_root}/collector.py" ]]; then
-        log_info "Deploying application from ${app_root}..."
-
-        # Copy core application files (exclude scripts themselves)
-        rsync -a --exclude='install.sh' --exclude='uninstall.sh' \
+        # Exclude deployment, installation scripts & user configs
+        rsync -a --delete \
+              --exclude='install.sh' \
+              --exclude='uninstall.sh' \
               --exclude='check_dependencies.sh' \
               --exclude='config.yaml' \
-              "${app_root}/" "${INSTALL_DIR}/" 2>/dev/null \
-            || cp -r "${app_root}/." "${INSTALL_DIR}/"
-
-        log_ok "Application files deployed to ${INSTALL_DIR}"
+              --exclude='data/' \
+              --exclude='logs/' \
+              --exclude='cache/' \
+              --exclude='__pycache__/' \
+              "${app_root}/" "${INSTALL_DIR}/"
+        log_ok "Application deployed to ${INSTALL_DIR}"
     else
-        log_warn "Application source not found at ${app_root} — skipping deployment"
-        log_warn "Please ensure collector.py and core/collectors/ are present"
+        log_fatal "Could not find collector.py in ${app_root}. Check your source repository."
     fi
 }
 
 # ── Step 6: Deploy configuration ─────────────────────────────────────────────
 install_step6_config() {
-    log_step 6 9 "Deploying configuration"
+    log_step 6 10 "Deploying configuration file"
 
-    if [[ -n "${CONFIG_FILE_SOURCE}" ]] && [[ -f "${CONFIG_FILE_SOURCE}" ]]; then
+    if [[ -n "${CONFIG_FILE_SOURCE}" && -f "${CONFIG_FILE_SOURCE}" ]]; then
+        if [[ "${CONFIG_FILE_SOURCE}" == "${CONFIG_FILE}" ]]; then
+            log_skip "Configuration file is already in place at ${CONFIG_FILE}"
+            return 0
+        fi
         if [[ "${DRY_RUN}" == "yes" ]]; then
             log_dry "Would copy ${CONFIG_FILE_SOURCE} to ${CONFIG_FILE}"
             return 0
         fi
         cp "${CONFIG_FILE_SOURCE}" "${CONFIG_FILE}"
-        log_ok "Config deployed: ${CONFIG_FILE}"
+        log_ok "Configuration deployed to ${CONFIG_FILE}"
     else
         if [[ "${DRY_RUN}" == "yes" ]]; then
-            log_dry "Would create default config at ${CONFIG_FILE}"
+            log_dry "Would create default configuration file"
             return 0
         fi
-        # Create a minimal default config
         cat > "${CONFIG_FILE}" << 'DEFAULTCONFIG'
-# AICollector configuration
-# Generated by install.sh
-
-collectors:
-  # Liste blanche — vide = tous les collecteurs sont actifs
-  # Décommentez et modifiez pour activer uniquement certains collecteurs
-  # enabled:
-  #   - system
-  #   - cpu
-  #   - ram
-  #   - auditd
-
-  # Liste noire — vide = aucun collecteur désactivé
-  # Décommentez pour désactiver des collecteurs spécifiques
-  # disabled:
-  #   - auditd
+# AICollector configuration file (FHS mode)
+server_uuid: null
+logging_level: INFO
 
 retention:
   history_versions: 50
@@ -397,131 +368,221 @@ scheduler:
   frequency_cron: "0 */2 * * *"
   use_systemd_timer: false
 
-logging:
-  level: INFO
+collectors:
+  enabled: []
+  disabled: []
+  timeout_seconds: 30
+  parallel: false
+  root_required_behavior: skip
+
+security:
+  allowed_commands: []
+  exclude_paths: []
+  redact_patterns: []
+
+paths:
+  base_dir: /var/lib/aicollector
+  config_dir: /etc/aicollector
+  cache_dir: /var/cache/aicollector
+  log_dir: /var/log/aicollector
+  lockfile_path: /run/aicollector/aicollector.lock
+  knowledge_subdir: knowledge
+  history_subdir: history
+  changes_subdir: changes
+  cache_subdir: cache
 DEFAULTCONFIG
-        log_ok "Default config created: ${CONFIG_FILE}"
+        log_ok "Default configuration file generated at ${CONFIG_FILE}"
     fi
 }
 
 # ── Step 7: Set permissions ─────────────────────────────────────────────────────
 install_step7_permissions() {
-    log_step 7 9 "Setting permissions"
+    log_step 7 10 "Applying secure FHS permissions"
 
     if [[ "${DRY_RUN}" == "yes" ]]; then
-        log_dry "Would set ownership of ${LIB_DIR}, ${LOG_DIR}, ${RUN_DIR} to ${USER_NAME}"
+        log_dry "Would apply secure ownership (root:root for opt, aicollector:aicollector for var/etc)"
         return 0
     fi
 
-    # Set ownership on data/logs directories
-    chown -R "${USER_NAME}:${USER_NAME}" "${LIB_DIR}"  2>/dev/null || log_warn "Could not set ownership on ${LIB_DIR}"
-    chown -R "${USER_NAME}:${USER_NAME}" "${LOG_DIR}"  2>/dev/null || log_warn "Could not set ownership on ${LOG_DIR}"
-    chown -R "${USER_NAME}:${USER_NAME}" "${CACHE_DIR}" 2>/dev/null || log_warn "Could not set ownership on ${CACHE_DIR}"
+    # Application binaries (read-only for daemon user)
+    chown -R root:root "${INSTALL_DIR}"
+    chmod -R 755 "${INSTALL_DIR}"
+    chmod +x "${INSTALL_DIR}/collector.py"
 
-    # Make collector.py executable
-    chmod +x "${INSTALL_DIR}/collector.py" 2>/dev/null || log_warn "Could not chmod collector.py"
+    # Configuration (readable but not writable by daemon user)
+    chown -R root:${GROUP_NAME} "${ETC_DIR}"
+    chmod 750 "${ETC_DIR}"
+    chmod 640 "${CONFIG_FILE}"
 
-    log_ok "Permissions set"
+    # Variable & State Directories
+    chown -R ${USER_NAME}:${GROUP_NAME} "${LIB_DIR}"
+    chmod -R 750 "${LIB_DIR}"
+
+    chown -R ${USER_NAME}:${GROUP_NAME} "${CACHE_DIR}"
+    chmod 750 "${CACHE_DIR}"
+
+    chown -R ${USER_NAME}:${GROUP_NAME} "${LOG_DIR}"
+    chmod 750 "${LOG_DIR}"
+
+    log_ok "Permissions successfully restricted"
 }
 
-# ── Step 8: Configure scheduler ───────────────────────────────────────────────
+# ── Step 8: Configure scheduler (Cron vs Systemd Timer) ───────────────────────
 install_step8_scheduler() {
-    log_step 8 9 "Configuring scheduler"
+    log_step 8 10 "Configuring pipeline scheduler"
 
     local schedule="${DEFAULT_SCHEDULE}"
-    if [[ -f "${CONFIG_FILE}" ]] && command -v python3 >/dev/null 2>&1; then
-        local configured_schedule
-        configured_schedule=$(python3 -c "
-import yaml, sys
-try:
-    with open('${CONFIG_FILE}') as f:
-        config = yaml.safe_load(f) or {}
-    scheduler = config.get('scheduler', {})
-    print(scheduler.get('frequency_cron', '0 */2 * * *'))
-except:
-    print('0 */2 * * *')
-" 2>/dev/null || echo "0 */2 * * *")
+    local use_timer="false"
+
+    if [[ -f "${CONFIG_FILE}" ]]; then
+        local configured_schedule configured_timer
+        configured_schedule=$(python3 -c "import yaml; c=yaml.safe_load(open('${CONFIG_FILE}')) or {}; print(c.get('scheduler', {}).get('frequency_cron', '0 */2 * * *'))" 2>/dev/null || echo "0 */2 * * *")
+        configured_timer=$(python3 -c "import yaml; c=yaml.safe_load(open('${CONFIG_FILE}')) or {}; print(str(c.get('scheduler', {}).get('use_systemd_timer', False)).lower())" 2>/dev/null || echo "false")
+        
         [[ -n "${configured_schedule}" ]] && schedule="${configured_schedule}"
+        [[ -n "${configured_timer}" ]] && use_timer="${configured_timer}"
     fi
 
+    # Remove any existing Cron jobs if Timer is preferred (or vice versa) to prevent double schedules
     if [[ "${DRY_RUN}" == "yes" ]]; then
-        log_dry "Would add cron entry: ${schedule} ${INSTALL_DIR}/collector.py --run"
+        log_dry "Would clean existing schedule conflicts"
+        if [[ "${use_timer}" == "true" ]]; then
+            log_dry "Would deploy Systemd Timer running: ${schedule}"
+        else
+            log_dry "Would deploy Cron schedule: ${schedule}"
+        fi
         return 0
     fi
 
-    # Add cron entry (idempotent — grep check before adding)
+    # Clean legacy cron
     local current_cron
-    current_cron=$(crontab -l 2>/dev/null || echo "")
-
+    current_cron=$(crontab -l 2>/dev/null || true)
     if echo "${current_cron}" | grep -q "${CRON_MARKER}"; then
-        log_skip "Cron entry already exists"
+        echo "${current_cron}" | grep -v "${CRON_MARKER}" | crontab - || true
+        log_info "Cleaned legacy cron schedules"
+    fi
+
+    # Clean legacy systemd files
+    if [[ -f "${UNIT_DIR}/${APP_NAME}.timer" ]]; then
+        systemctl disable --now "${APP_NAME}.timer" 2>/dev/null || true
+        rm -f "${UNIT_DIR}/${APP_NAME}.service" "${UNIT_DIR}/${APP_NAME}.timer"
+        systemctl daemon-reload
+        log_info "Cleaned legacy systemd timers"
+    fi
+
+    if [[ "${use_timer}" == "true" ]]; then
+        # ── Systemd Timer Schedule ───────────────────────────────────────
+        cat > "${UNIT_DIR}/${APP_NAME}.service" <<EOF
+[Unit]
+Description=AICollector Server Knowledge Collector Pipeline
+After=network.target
+
+[Service]
+Type=oneshot
+User=${USER_NAME}
+Group=${GROUP_NAME}
+ExecStart=${INSTALL_DIR}/collector.py run
+StandardOutput=journal
+StandardError=journal
+EOF
+
+        # Convert simple daily/hourly common cron intervals to systemd-style
+        local calendar="*-*-* 00,02,04,06,08,10,12,14,16,18,20,22:00:00" # Default 2 hours
+        if [[ "${schedule}" == "0 * * * *" ]]; then
+            calendar="hourly"
+        elif [[ "${schedule}" == "0 0 * * *" ]]; then
+            calendar="daily"
+        fi
+
+        cat > "${UNIT_DIR}/${APP_NAME}.timer" <<EOF
+[Unit]
+Description=Run AICollector Pipeline periodically
+
+[Timer]
+OnCalendar=${calendar}
+AccuracySec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+        systemctl daemon-reload
+        systemctl enable --now "${APP_NAME}.timer"
+        log_ok "Systemd Timer successfully configured & enabled (${calendar})"
     else
-        local cron_entry="${schedule} ${INSTALL_DIR}/collector.py --run ${CRON_MARKER}"
-        (echo "${current_cron}"; echo "${cron_entry}") | crontab - \
-            || { log_warn "Could not update crontab"; return 1; }
-        log_ok "Cron entry added: ${schedule}"
+        # ── Classic Cron Schedule ───────────────────────────────────────
+        local cron_entry="${schedule} ${INSTALL_DIR}/collector.py run ${CRON_MARKER}"
+        (crontab -l 2>/dev/null || true; echo "${cron_entry}") | crontab -
+        log_ok "Cron scheduler configured successfully (${schedule})"
     fi
 }
 
 # ── Step 9: Configure tmpfiles.d ──────────────────────────────────────────────
 install_step9_tmpfiles() {
-    log_step 9 9 "Configuring tmpfiles.d"
+    log_step 9 10 "Setting up runtime volatile directory (tmpfiles.d)"
 
     if [[ "${DRY_RUN}" == "yes" ]]; then
-        log_dry "Would create /etc/tmpfiles.d/${APP_NAME}.conf"
+        log_dry "Would write configuration /etc/tmpfiles.d/${APP_NAME}.conf"
         return 0
     fi
 
-    if [[ -f "/etc/tmpfiles.d/${APP_NAME}.conf" ]]; then
-        log_skip "tmpfiles.d config already exists"
-    else
-        cat > "/etc/tmpfiles.d/${APP_NAME}.conf" << EOF
+    cat > "/etc/tmpfiles.d/${APP_NAME}.conf" << EOF
 # Type Path               Mode UID           GID           Age Argument
-d     ${RUN_DIR}           0755 ${USER_NAME} ${USER_NAME} - -
+d     ${RUN_DIR}           0755 ${USER_NAME} ${GROUP_NAME} - -
 EOF
-        tmpfiles --create "/etc/tmpfiles.d/${APP_NAME}.conf" 2>/dev/null \
-            || log_warn "tmpfiles --create failed (may be benign)"
-        log_ok "tmpfiles.d configured"
-    fi
+    systemd-tmpfiles --create "/etc/tmpfiles.d/${APP_NAME}.conf" 2>/dev/null || log_warn "Systemd-tmpfiles failed to run immediately (will apply upon reboot)"
+    log_ok "tmpfiles.d configuration set up successfully"
 }
 
-# ── Main ────────────────────────────────────────────────────────────────────────
+# ── Step 10: Configure logrotate ──────────────────────────────────────────────
+install_step10_logrotate() {
+    log_step 10 10 "Configuring log rotation"
+
+    if [[ "${DRY_RUN}" == "yes" ]]; then
+        log_dry "Would create /etc/logrotate.d/${APP_NAME}"
+        return 0
+    fi
+
+    cat > "/etc/logrotate.d/${APP_NAME}" << EOF
+${LOG_DIR}/*.log {
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    sharedscripts
+    create 0640 ${USER_NAME} ${GROUP_NAME}
+}
+EOF
+    log_ok "Logrotate policy configured at /etc/logrotate.d/${APP_NAME}"
+}
+
+# ── Main Entrypoint ──────────────────────────────────────────────────────────────
 main() {
     echo ""
     echo -e "${BOLD}═══════════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}  AICollector — Installation Script${NC}"
+    echo -e "${BOLD}  AICollector — Hardened Installer [Ubuntu 26.04 LTS]${NC}"
     echo -e "${BOLD}═══════════════════════════════════════════════════════════════════${NC}"
     echo ""
 
     require_root
+    check_disk_space
 
     if [[ "${DRY_RUN}" == "yes" ]]; then
-        echo -e "${CYAN}MODE: DRY-RUN (no files will be created or modified)${NC}"
+        echo -e "${CYAN}MODE: DRY-RUN active (simulation mode)${NC}"
         echo ""
     fi
 
-    echo "This script will:"
-    echo "  • Install system dependencies (always)"
-    echo "  • Install auditd only if 'auditd' collector is active in config.yaml"
-    echo "  • Create system user '${USER_NAME}'"
-    echo "  • Create directory structure"
-    echo "  • Deploy application files to ${INSTALL_DIR}"
-    echo "  • Deploy configuration to ${ETC_DIR}"
-    echo "  • Set correct permissions"
-    echo "  • Configure scheduling (cron)"
-    echo "  • Configure tmpfiles.d"
-    echo ""
-
     if [[ "${DRY_RUN}" != "yes" ]]; then
-        echo -n "Proceed with installation? [y/N]: "
+        echo -n "Proceed with production installation? [y/N]: "
         read -r response < /dev/tty
         if [[ ! "${response}" =~ ^[Yy]$ ]]; then
-            echo "Aborted."
-            exit 0
+            log_fatal "Installation cancelled by operator."
         fi
     fi
 
-    echo ""
     install_step1_config
     install_step2_dependencies
     install_step3_user
@@ -531,20 +592,19 @@ main() {
     install_step7_permissions
     install_step8_scheduler
     install_step9_tmpfiles
+    install_step10_logrotate
 
     echo ""
     echo -e "${BOLD}═══════════════════════════════════════════════════════════════════${NC}"
     if [[ "${DRY_RUN}" == "yes" ]]; then
-        echo -e "${CYAN}Installation dry-run completed.${NC}"
-        echo -e "${CYAN}Run without --dry-run to perform actual installation.${NC}"
+        echo -e "${CYAN}Hardened installation dry-run complete without error.${NC}"
     else
-        echo -e "${GREEN}AICollector installed successfully!${NC}"
+        echo -e "${GREEN}AICollector has been successfully deployed and restricted!${NC}"
         echo ""
-        echo "Next steps:"
-        echo "  1. Review configuration: ${CONFIG_FILE}"
-        echo "  2. Run the collector:   sudo ${INSTALL_DIR}/collector.py --run"
-        echo "  3. Check logs:          tail -f ${LOG_DIR}/aicollector.log"
-        echo "  4. Uninstall:            sudo bash ${INSTALL_DIR}/../uninstall.sh"
+        echo "Operational commands:"
+        echo "  - Manual Execute:   sudo ${INSTALL_DIR}/collector.py run"
+        echo "  - Check Status:     sudo ${INSTALL_DIR}/collector.py check"
+        echo "  - View Logs:        tail -f ${LOG_DIR}/aicollector.log"
     fi
     echo -e "${BOLD}═══════════════════════════════════════════════════════════════════${NC}"
     echo ""
