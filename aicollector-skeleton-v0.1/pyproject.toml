@@ -1,58 +1,99 @@
+# =============================================================================
+# pyproject.toml — Configuration déclarative standardisée (PEP 518 & PEP 621)
+# Project: AICollector
+# Target: Python >= 3.12 (Ubuntu Server 26.04 LTS)
+# =============================================================================
+
 [project]
 name = "aicollector"
 version = "0.1.0"
 description = "Read-only server knowledge collector for AI agents"
 readme = "README.md"
-requires-python = ">= 3.12"
-license = {text = "MIT"}
+requires-python = ">=3.12"
+license = { text = "MIT" } # Conformité SPDX brute
 authors = [
-    {name = "AICollector Team"},
+    { name = "AICollector Team", email = "maintainer@aicollector.local" }
 ]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: System Administrators",
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: System :: Monitoring",
+    "Typing :: Typed",
 ]
 
+# Dépendances de production strictes (Fail-Fast sur versions incompatibles)
 dependencies = [
-    "pydantic>=2.0",
-    "pyyaml>=6.0",
+    "pydantic>=2.4.0",
+    "pyyaml>=6.0.1",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0",
-    "pytest-cov>=4.0",
-    "mypy>=1.0",
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+    "mypy>=1.8.0",
+    "types-PyYAML>=6.0.12.12", # Stubs de types pour valider PyYAML de manière stricte
 ]
 
 [project.scripts]
+# Déclenche la commande globale 'aicollector' qui appelle la fonction main du script d'entrée
 aicollector = "collector:main"
 
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=68.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
+# Configuration de la découverte de modules par Setuptools
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["core*", "collectors*"]
 
+# ── Configuration de l'analyse statique Mypy (Hardened) ──────────────────────
 [tool.mypy]
 python_version = "3.12"
 strict = true
 warn_return_any = true
 warn_unused_ignores = true
+warn_unreachable = true
+no_implicit_reexport = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+
+# Ignorer de manière chirurgicale les imports non typés sans désactiver le typage global
+[[tool.mypy.overrides]]
+module = "yaml.*"
 ignore_missing_imports = true
 
+# ── Configuration du Framework de Tests Pytest ────────────────────────────────
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "--cov=aicollector --cov-report=term-missing"
+addopts = "--cov=core --cov=collectors --cov-report=term-missing --cov-fail-under=80 --strict-markers"
+markers = [
+    "unit: Tests unitaires isolés (sans appels OS)",
+    "integration: Tests d'intégration (avec mock d'appels système)",
+]
 
+# ── Configuration de la couverture de tests (Coverage.py) ──────────────────────
 [tool.coverage.run]
+branch = true # Mesure la couverture de branche pour une validation algorithmique stricte
 source = ["core", "collectors"]
-omit = ["tests/*", "*/__pycache__/*"]
+omit = [
+    "tests/*",
+    "*/__pycache__/*",
+    "setup.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
