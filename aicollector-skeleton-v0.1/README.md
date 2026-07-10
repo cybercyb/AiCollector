@@ -102,6 +102,18 @@ sudo systemctl start aicollector
 sudo systemctl status aicollector
 ```
 
+### Desinstallation
+
+```bash
+sudo bash scripts/uninstall.sh           # Complete
+sudo bash scripts/uninstall.sh --dry-run # Simulation
+sudo bash scripts/uninstall.sh --force   # Forcer meme si erreurs
+```
+
+**Ce que uninstall.sh supprime :** utilisateur systeme aicollector, /opt/aicollector/, /etc/aicollector/, /var/lib/aicollector/, /var/cache/aicollector/, /var/log/aicollector/, /run/aicollector/, unites systemd (service + timer), auditd conditionnel.
+
+**Robustesse (Decision #20) :** userdel SANS --remove-home, arret processus AVANT suppression, gestion PID 1 dans lockfile.
+
 ### Configuration
 
 Le fichier de configuration se trouve dans **`/opt/aicollector/config.yaml`** :
@@ -609,6 +621,47 @@ print('✅ JSON valide et conforme au schéma:', result.source)
 5. Commit et push
 ```
 
+### Le fichier pyproject.toml (PEP 621)
+
+```toml
+[project]
+name = "aicollector"
+version = "0.1.0"
+requires-python = ">= 3.12"
+dependencies = ["pydantic>=2.0", "pyyaml>=6.0"]
+
+[project.scripts]
+aicollector = "collector:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-cov>=4.0", "mypy>=1.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "collectors*"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+```
+
+**Point critique (Decision #11) :** sys.path.insert(0, ...) est INTERDIT. Utiliser sys.path.append() ou importlib.
+
+### Validation mypy + couverture
+
+```bash
+mypy core/ collectors/ --strict
+pytest tests/ --cov=aicollector --cov-report=html
+```
+
+**Objectifs de couverture (Decision #21) :**
+- Modules core : >= 80%
+- Collecteurs : >= 70%
+- Logger, sanitizers, validators : >= 90%
+
 ### Bonnes pratiques
 
 **Nommage :**
@@ -655,6 +708,9 @@ print('✅ JSON valide et conforme au schéma:', result.source)
 | 16 | 2026-07-09 | Fichier de lock (os.kill avec signal 0) | **ACTIVE** |
 | 17 | 2026-07-10 | Correction NameError Literal + RAM schema | **ACTIVE** |
 | 18 | 2026-07-10 | Robustesse self_diagnostic (disk check parent) | **ACTIVE** |
+| 19 | 2026-07-10 | Entree systemd timer comme alter. au cron | **ACTIVE** |
+| 20 | 2026-07-10 | Robustesse uninstall.sh (userdel, order, pid1) | **ACTIVE** |
+| 21 | 2026-07-10 | Extension mypy + coverage pytest | **ACTIVE** |
 
 ### Décision #11 — Politique `sys.path`
 
