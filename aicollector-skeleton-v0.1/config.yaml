@@ -1,41 +1,92 @@
-# AICollector configuration file
-# Default values are shown — override only the keys you need.
+# =============================================================================
+# AICollector — Fichier de Configuration (Production / Ubuntu Server 26.04)
+# =============================================================================
 
-server_uuid: null          # Auto-generated on first run if null
+# Identifiant unique de ce serveur (UUIDv4).
+# S'il est laissé à null, il sera auto-généré au premier lancement et persistera
+# dans le fichier de manifest de la base de connaissances.
+server_uuid: null
+
+# Niveau de verbosité de la journalisation structurée NDJSON.
+# Valeurs acceptées : DEBUG, INFO, WARNING, ERROR, CRITICAL
 logging_level: INFO
 
-# Retention policies
+# ── Politiques de Rétention (Purge FIFO automatique) ───────────────────────
 retention:
-  history_versions: 50    # Snapshots per collector in history/
-  changes_entries: 200   # Max entries in changes/ (FIFO purge)
-  logs_days: 30           # Days of log retention
+  # Nombre maximal de snapshots historiques conservés par collecteur
+  history_versions: 50
+  
+  # Nombre de détections de changements de configuration historisées
+  changes_entries: 200
+  
+  # Durée de conservation des journaux de logs applicatifs (en jours)
+  logs_days: 30
 
-# Scheduler
+# ── Planification de l'exécution ─────────────────────────────────────────────
 scheduler:
-  frequency_cron: "0 */2 * * *"   # Every 2 hours (default)
-  use_systemd_timer: false         # Set to true to use systemd timer instead of cron
+  # Fréquence d'exécution nominale par Cron (toutes les 2 heures par défaut)
+  frequency_cron: "0 */2 * * *"
+  
+  # Si défini à true, le script d'installation configure un Systemd Timer
+  # à la place de la tâche Cron classique
+  use_systemd_timer: false
 
-# Collectors
+# ── Configuration des Collecteurs de Connaissances ────────────────────────────
 collectors:
-  enabled: []           # Empty = all enabled; fill with names to enable only those
-  disabled: []          # Fill with names to disable specific collectors
-  timeout_seconds: 30   # Per-collector timeout
-  parallel: false       # V1.1+ — parallel execution
-  root_required_behavior: skip    # skip | warn | fail
+  # Liste de restriction exclusive (Whitelist) :
+  # Si renseignée, SEULS les collecteurs listés seront exécutés (ex: ["cpu", "ram"])
+  enabled: []
+  
+  # Liste d'exclusion (Blacklist) :
+  # Les collecteurs spécifiés ici seront totalement ignorés (ex: ["docker", "smart"])
+  disabled: []
+  
+  # Temps d'exécution maximum alloué par collecteur (en secondes)
+  timeout_seconds: 30
+  
+  # [V1.1+] Activation expérimentale de la collecte en parallèle
+  parallel: false
+  
+  # Comportement lorsqu'un collecteur requiert les droits root mais est lancé
+  # avec un utilisateur non-privilégié (ex: aicollector).
+  # Options :
+  #   - "skip" : Ignore poliment le collecteur sans lever d'erreur bloquante
+  #   - "warn" : Exécute le collecteur, capture l'échec et loggue un avertissement
+  #   - "fail" : Interrompt le run complet en erreur critique (Exit Code 2)
+  root_required_behavior: skip
 
-# Security
+# ── Sécurité et Défense en Profondeur ─────────────────────────────────────────
 security:
-  allowed_commands: []   # Defaults to the hardcoded whitelist in SystemAdapter
-  exclude_paths: []       # Paths never to be read
-  redact_patterns: []     # Additional regex patterns for secret detection
+  # Liste de commandes système autorisées. Si vide, utilise la Whitelist native
+  # codée en dur dans le SystemAdapter par mesure de sécurité
+  allowed_commands: []
+  
+  # Liste de chemins système dont la lecture est strictement interdite (Blacklist)
+  # par le SystemAdapter (ex: ["/etc/shadow", "/etc/ssl/private"])
+  exclude_paths: []
+  
+  # Expressions régulières additionnelles pour détecter et masquer (redact)
+  # d'éventuels secrets systèmes non interceptés par le désinfecteur de base
+  redact_patterns: []
 
-# Paths (FHS — overridden by AICOLLECTOR_ROOT in dev mode)
+# ── Chemins FHS Applicatifs (Overridés automatiquement en mode dev) ───────────
 paths:
+  # Répertoire racine persistant pour les données récoltées
   base_dir: /var/lib/aicollector
+  
+  # Répertoire de configuration système
   config_dir: /etc/aicollector
+  
+  # Répertoire temporaire de travail et cache intra-run
   cache_dir: /var/cache/aicollector
+  
+  # Répertoire d'écriture du fichier de log tournant (NDJSON)
   log_dir: /var/log/aicollector
+  
+  # Fichier de verrou volatile pour prévenir les exécutions concurrentes
   lockfile_path: /run/aicollector/aicollector.lock
+  
+  # Sous-répertoires d'organisation au sein de "base_dir"
   knowledge_subdir: knowledge
   history_subdir: history
   changes_subdir: changes
