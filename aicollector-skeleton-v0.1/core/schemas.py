@@ -1,7 +1,7 @@
 """Pydantic schemas for all collector JSON outputs with dynamic registry."""
 from __future__ import annotations
 
-from typing import Annotated, Any, Union
+from typing import Annotated, Any, Union, Literal
 from pydantic import BaseModel, Field, ConfigDict
 
 # ── Schema registry ───────────────────────────────────────────────────────────
@@ -22,7 +22,7 @@ def register_collector_schema(name: str):
     return decorator
 
 
-def validate_knowledge_json(data: dict[str, Any]) -> BaseModel:
+def validate_knowledge_json(data: dict[str, Any]) -> BaseModel | dict[str, Any]:
     """Validate a knowledge JSON against the appropriate registered schema.
 
     Args:
@@ -37,25 +37,22 @@ def validate_knowledge_json(data: dict[str, Any]) -> BaseModel:
     source = data.get("source", "unknown")
     schema_cls = _COLLECTOR_SCHEMA_REGISTRY.get(source)
     if schema_cls is None:
-        return data  # type: ignore[return-value]
+        return data
     return schema_cls.model_validate(data)
 
 
 # ── Common fields ─────────────────────────────────────────────────────────────
 
-_CommonFields = {
-    "schema_version": str,
-    "collector_version": str,
-    "server_uuid": str,
-    "timestamp_utc": str,
-    "source": str,
-    "hash": str,
-}
+class CollectorCapabilitiesSchema(BaseModel):
+    """Capabilities describing the runtime context of the collector."""
+    supported_platforms: list[str] = Field(default_factory=list)
+    min_confidence: float = 1.0
+    known_inconsistencies: list[str] = Field(default_factory=list)
 
 
 class CommonSchema(BaseModel):
     """Shared fields present in every collector JSON output."""
-    model_config = ConfigDict(str_strip_whitespace=True)
+    model_config = ConfigDict(str_strip_whitespace=True, extra="ignore")
 
     schema_version: str = Field(pattern=r"^\d+\.\d+$")
     collector_version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
@@ -69,12 +66,6 @@ class CommonSchema(BaseModel):
 
 
 # ── CPU ───────────────────────────────────────────────────────────────────────
-
-class CPUCapabilities(BaseModel):
-    supported_platforms: list[str]
-    min_confidence: float
-    known_inconsistencies: list[str] = Field(default_factory=list)
-
 
 class CPUContent(BaseModel):
     model: str
@@ -97,7 +88,7 @@ class CPUCollectorSchema(CommonSchema):
     """Schema for the CPU collector."""
     source: Literal["cpu"] = "cpu"
     content: CPUContent
-    capabilities: CPUCapabilities | None = None
+    capabilities: CollectorCapabilitiesSchema | None = None
 
 
 # ── System ────────────────────────────────────────────────────────────────────
@@ -118,7 +109,7 @@ class SystemCollectorSchema(CommonSchema):
     """Schema for the system/hostname collector."""
     source: Literal["system"] = "system"
     content: SystemContent
-    capabilities: dict | None = None
+    capabilities: CollectorCapabilitiesSchema | None = None
 
 
 # ── RAM ───────────────────────────────────────────────────────────────────────
@@ -139,9 +130,9 @@ class RAMContent(BaseModel):
 @register_collector_schema("ram")
 class RAMCollectorSchema(CommonSchema):
     """Schema for the RAM/memory collector."""
-    source: Literal["system"] = "system"  # Note: ram uses source="system" per spec
+    source: Literal["ram"] = "ram"  # Correction : Doit correspondre à la clé d'enregistrement
     content: RAMContent
-    capabilities: dict | None = None
+    capabilities: CollectorCapabilitiesSchema | None = None
 
 
 # ── Storage ───────────────────────────────────────────────────────────────────
@@ -166,7 +157,7 @@ class StorageCollectorSchema(CommonSchema):
     """Schema for the storage/df collector."""
     source: Literal["storage"] = "storage"
     content: StorageContent
-    capabilities: dict | None = None
+    capabilities: CollectorCapabilitiesSchema | None = None
 
 
 # ── Network ───────────────────────────────────────────────────────────────────
@@ -218,7 +209,7 @@ class NetworkCollectorSchema(CommonSchema):
     """Schema for the network collector."""
     source: Literal["network"] = "network"
     content: NetworkContent
-    capabilities: dict | None = None
+    capabilities: CollectorCapabilitiesSchema | None = None
 
 
 # ── Docker ────────────────────────────────────────────────────────────────────
@@ -299,7 +290,7 @@ class DockerCollectorSchema(CommonSchema):
     """Schema for the Docker collector."""
     source: Literal["docker"] = "docker"
     content: DockerContent
-    capabilities: dict | None = None
+    capabilities: CollectorCapabilitiesSchema | None = None
 
 
 # ── Systemd services ──────────────────────────────────────────────────────────
@@ -324,4 +315,4 @@ class SystemdServicesCollectorSchema(CommonSchema):
     """Schema for the systemd services collector."""
     source: Literal["systemd_services"] = "systemd_services"
     content: SystemdServicesContent
-    capabilities: dict | None = None
+    capabilities: CollectorCapabilitiesSchema | None = None
