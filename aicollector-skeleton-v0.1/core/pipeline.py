@@ -88,7 +88,7 @@ class Pipeline:
         
         self._stats = PipelineStats(run_id=run_id, started_at=started_at)
         logger.info("Pipeline run started", extra={"run_id": run_id})
-        self._event_bus.emit(Event(RUN_STARTED, {"run_id": run_id}))
+        self._event_bus.emit(Event("run.started", {"run_id": run_id}))
 
         success = False
         try:
@@ -128,7 +128,7 @@ class Pipeline:
                 )
             
             if success:
-                self._event_bus.emit(Event(RUN_FINISHED, {
+                self._event_bus.emit(Event("run.finished", {
                     "run_id": run_id,
                     "duration_ms": duration_ms,
                     "stats": {
