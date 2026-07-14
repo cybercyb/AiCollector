@@ -316,3 +316,26 @@ class SystemdServicesCollectorSchema(CommonSchema):
     source: Literal["systemd_services"] = "systemd_services"
     content: SystemdServicesContent
     capabilities: CollectorCapabilitiesSchema | None = None
+
+
+# ── APT/Packages ──────────────────────────────────────────────────────────────
+
+class APTPackageSchema(BaseModel):
+    name: str = Field(..., description="Name of the debian package")
+    version: str = Field(..., description="Installed package version")
+    architecture: str = Field(..., description="Target CPU architecture")
+    size_bytes: int = Field(..., description="Approximate installed size on disk in bytes")
+    summary: str = Field(..., description="Short summary description of the package")
+
+
+class APTContent(BaseModel):
+    packages: list[APTPackageSchema] = Field(default_factory=list)
+    total_packages: int = 0
+
+
+@register_collector_schema("apt")
+class APTCollectorSchema(CommonSchema):
+    """Schema for the APT/DPKG installed packages collector."""
+    source: Literal["apt"] = "apt"
+    content: APTContent
+    capabilities: CollectorCapabilitiesSchema | None = None
