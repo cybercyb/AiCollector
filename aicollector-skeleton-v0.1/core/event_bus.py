@@ -1,19 +1,28 @@
 """Synchronous in-process pub/sub event bus."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Any, Callable
 
 from core.exceptions import EventBusError
+
+# Initialisation du logger pour tracer les défaillances des abonnés
+logger = logging.getLogger("aicollector")
+
+
+def _get_utc_now_z() -> str:
+    """Return current UTC time in strict ISO8601 format ending with 'Z'."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 @dataclass(frozen=True, slots=True)
 class Event:
     """Immutable event object emitted by the pipeline."""
     event_type: str
-    payload: dict
-    timestamp_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    payload: dict[str, Any] = field(default_factory=dict)
+    timestamp_utc: str = field(default_factory=_get_utc_now_z)
 
 
 # Public event type constants
@@ -29,11 +38,14 @@ EXPORT_STARTED = "export.started"
 
 
 class EventBus:
-    """Singleton synchronous event dispatcher.
+    """Synchronous event dispatcher.
 
     Subscribers register callbacks for specific event types.
     When ``emit()`` is called, all registered handlers are invoked
     synchronously in the calling thread.
+    
+    Any exception raised by a subscriber is caught, logged, and does
+    not interrupt the event propagation or the pipeline execution.
     """
 
     def __init__(self) -> None:
@@ -43,7 +55,7 @@ class EventBus:
         """Register a handler for the given event type.
 
         Args:
-            event_type: Event type string (e.g. ``"run.finished"``).
+            event_type: Event type string (e.g. ``"run.finished"``) or ``"*"`` for all.
             handler: Callable that will be invoked with an ``Event`` instance.
         """
         if event_type not in self._subscribers:
@@ -51,24 +63,38 @@ class EventBus:
         self._subscribers[event_type].append(handler)
 
     def emit(self, event: Event) -> None:
-        """Dispatch ``event`` to all registered handlers.
+        """Dispatch ``event`` to all registered handlers synchronously.
+
+        Failures in subscribers are non-blocking: they are logged as errors, 
+        but do not prevent other subscribers from running, nor do they interrupt 
+        the core execution flow of the pipeline.
 
         Args:
             event: The event to dispatch.
-
-        Raises:
-            EventBusError: If a handler raises unexpectedly.
         """
+        # Récupération des handlers spécifiques
         handlers = list(self._subscribers.get(event.event_type, []))
-        # Also deliver to wildcard subscribers
+        # Ajout des handlers wildcard (*)
         handlers.extend(self._subscribers.get("*", []))
+
         for handler in handlers:
             try:
                 handler(event)
             except Exception as exc:  # noqa: BLE001
-                raise EventBusError(
-                    f"Handler for '{event.event_type}' raised: {exc}"
-                ) from exc
+                # On encapsule l'erreur dans un EventBusError pour le log structuré
+                wrapped_error = EventBusError(
+                    f"Handler '{handler.__name__}' failed on event '{event.event_type}': {exc}"
+                )
+                # Log d'erreur non-bloquant : protège le cycle de vie du pipeline
+                logger.error(
+                    "EventBus non-blocking error: %s", 
+                    wrapped_error, 
+                    exc_info=True,
+                    extra={
+                        "event_type": event.event_type,
+                        "handler_name": handler.__name__
+                    }
+                )
 
     def clear(self) -> None:
         """Remove all subscribers. Useful for testing."""

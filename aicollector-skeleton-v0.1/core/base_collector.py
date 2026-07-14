@@ -4,9 +4,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, ClassVar
+from typing import Any, ClassVar, TYPE_CHECKING
 
-if False:
+if TYPE_CHECKING:
     from core.system_adapter import SystemAdapter
 
 
@@ -18,10 +18,22 @@ class Severity(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class CollectorErrorEntry:
+    """Standardized non-blocking error entry for collectors.
+    
+    Used to document partial failures (e.g., one command failed, 
+    but others succeeded) without crashing the entire run.
+    """
+    error_type: str            # e.g., "CommandTimeoutError", "ProcFileReadError"
+    message: str               # Human-readable error message
+    details: dict[str, Any] = field(default_factory=dict) # Metadata (e.g., cmd, path)
+
+
+@dataclass(frozen=True, slots=True)
 class CollectorResult:
     """Result returned by a collector's ``collect()`` method."""
     data: dict[str, Any]
-    errors: list[dict[str, Any]]
+    errors: list[CollectorErrorEntry]  # Enforce typed error entries
     execution_time_ms: float
     raw_output: str | None = None
 
@@ -48,7 +60,7 @@ class BaseCollector(ABC):
     timeout_seconds: ClassVar[int] = 30
 
     @abstractmethod
-    def collect(self, system: "SystemAdapter") -> CollectorResult:
+    def collect(self, system: SystemAdapter) -> CollectorResult:
         """Collect raw system data via the SystemAdapter.
 
         Args:
