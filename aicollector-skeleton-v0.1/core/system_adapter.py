@@ -29,7 +29,7 @@ ALLOWED_COMMANDS: Final[frozenset[str]] = frozenset({
     "sensors", "nproc", "hostname", "uname", "ls",
     "cat", "grep", "awk", "cut", "sort", "uniq",
     "wc", "find", "stat", "id", "whoami", "uptime",
-    "free", "mount", "ps", "netstat",
+    "free", "mount", "ps", "netstat", "dpkg-query", "apt",
 })
 
 # Arguments suspects qui pourraient être utilisés pour détourner une commande whitelistée
