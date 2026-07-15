@@ -73,7 +73,21 @@ class CPUCollector(BaseCollector):
         data["cpu_flags"] = cpu_flags
 
         # 3. Topologie des cœurs
-        cores_logical = os.cpu_count() or 0
+        cores_logical = 0
+        try:
+            # Compte le nombre d'occurrences de "processor" dans /proc/cpuinfo
+            cores_logical = cpuinfo_content.count("processor\t:") or cpuinfo_content.count("processor :")
+        except Exception:
+            pass
+
+        if cores_logical == 0:
+            # Fallback ultime via os.cpu_count() enveloppé de manière sécurisée
+            try:
+                cores_logical = os.cpu_count() or 1
+            except TypeError:
+                # Si l'implémentation buggue et attend des arguments
+                cores_logical = 1
+
         if cores_physical == 0:
             # Fallback si l'extraction par physical_id a échoué (ex: VM monocœur)
             cores_physical = cores_logical
