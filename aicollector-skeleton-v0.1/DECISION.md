@@ -1,3 +1,4 @@
+[DECISIONS.md](https://github.com/user-attachments/files/30080870/DECISIONS.md)
 # DECISIONS D'ARCHITECTURE — AICollector
 # Registre unifié — Version consolidée au 2026-07-09
 
@@ -513,4 +514,56 @@ dev = ["pytest>=8.0", "pytest-cov>=4.0", "mypy>=1.0"]
 
 Objectifs : core >= 80%, collecteurs >= 70%, logger/sanitizers >= 90%.
 
-*Derniere mise a jour : 2026-07-10*
+---
+
+## Décision #22
+
+| Champ | Valeur |
+|---|---|
+| **Date** | 2026-07-15 |
+| **Sujet** | Scission de la validation des arguments en deux filtres distincts |
+| **Statut** | **ACTIVE** |
+
+**Contexte :** Le motif `sh` était vérifié par simple sous-chaîne (`pattern in lower_arg`). Cela bloquait légitimement des arguments `--show` ou `dash` contenant cette séquence, générant des `ForbiddenCommandError` pour des collecteurs parfaitement valides.
+
+**Solution :** Séparer `DANGEROUS_ARG_PATTERNS` en deux ensembles distincts dans `system_adapter.py` :
+
+**1. `DANGEROUS_SUBSTRING_PATTERNS`** — vérifié par `pattern in lower_arg` :
+```python
+DANGEROUS_SUBSTRING_PATTERNS: Final[frozenset[str]] = frozenset({
+    "-exec", "system", "eval", ">", "<", "|", ";", "&&", "||"
+})
+```
+→ Inclut les opérateurs de contrôle shell, redirections et motifs d'exécution dangereux.
+
+**2. `DANGEROUS_EXECUTABLE_NAMES`** — vérifié par `exact match` ou `/sh` suffix :
+```python
+DANGEROUS_EXECUTABLE_NAMES: Final[frozenset[str]] = frozenset({
+    "sh", "bash", "python", "perl", "ruby", "php",
+    "nc", "ncat", "curl", "wget"
+})
+```
+→ Inclut les interpréteurs et outils réseau suspects. Le suffixe `/sh` est également vérifié pour parer à `/bin/sh`.
+
+**Nouvelle logique de `_validate_safe_args` :**
+```python
+for arg in args:
+    lower_arg = arg.lower()
+    # Filtre A : sous-chaînes interdites (injection, contrôle shell)
+    if any(pattern in lower_arg for pattern in DANGEROUS_SUBSTRING_PATTERNS):
+        raise ForbiddenCommandError(f"{cmd} (rejected: substring '{arg}')")
+    # Filtre B : exécutables suspects (exact match)
+    if lower_arg in DANGEROUS_EXECUTABLE_NAMES or lower_arg.endswith('/sh'):
+        raise ForbiddenCommandError(f"{cmd} (rejected: executable '{arg}')")
+```
+
+**Justification :**
+- `sh` n'apparaît jamais comme argument standalone dans une commande légitime whitelistée — c'est toujours un chemin (`/bin/sh`) ou unappel direct, jamais un argument comme `--show`.
+- En séparant la logique, on préserve une sécurité maximale tout en éliminant les faux positifs.
+- Les opérateurs de contrôle (`;`, `&&`, `|`, `-exec`) restent interceptés par sous-chaîne — c'est correct et nécessaire.
+
+**Contexte technique :**
+- Collecteurs affectés : `dpkg-query -W --showformat='${Status}\n'` (contient `--show` → `sh` substring) et autres utilisant des arguments avec des sous-chaînes commonnes.
+- Faux positifs éliminés : `--show`, `dash`, `bash` (dans un chemin), `push`, etc.
+
+*Derniere mise a jour : 2026-07-15*
