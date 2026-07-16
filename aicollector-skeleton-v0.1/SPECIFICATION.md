@@ -1,4 +1,3 @@
-[SPECIFICATION V1.2.md](https://github.com/user-attachments/files/30080800/SPECIFICATION.V1.2.md)
 > **STATUT : VERSION FIGÉE ET VALIDÉE — Référence technique absolue du projet. Toute modification future doit d'abord être répercutée ici avant toute modification du code.**  
 > **Date de verrouillage :** 5 juillet 2026 — Version verrouillée par le client après revue complète.
 
@@ -53,6 +52,7 @@ Le projet obéit à trois principes non négociables :
 | **Lecture seule stricte** | Aucune commande destructive n'est exécutée, aucun fichier n'est modifié, aucun service n'est redémarré. L'outil ne fait qu'observer. |
 | **Zéro jugement** | AICollector ne dit jamais "c'est bien ou mal". Il détecte un changement et le signale avec sa sévérité factuelle. L'interprétation appartiennent à l'IA consommatrice. |
 | **Extensibilité par conception** | Ajouter un nouveau collecteur ne nécessite jamais de modifier le cœur du pipeline. L'architecture repose sur un registre dynamique et un décorateur d'enregistrement. |
+| **Métadonnées résilientes** | L'UUID du serveur est persistant, validé et auto-guéri. Le pipeline vérifie sa présence en Phase 0 avant toute collecte. |
 
 ### 1.3 Périmètre
 
@@ -60,7 +60,7 @@ Le projet obéit à trois principes non négociables :
 
 - Collecte de 15 catégories d'informations système sur Ubuntu 26.04 LTS
 - Auto-découverte dynamique des collecteurs via `pkgutil.iter_modules()`
-- Pipeline en 4 phases : COLLECT → NORMALIZE → COMPARE → KNOWLEDGE BASE
+- Pipeline en 5 phases : INITIALIZE METADATA → COLLECT → NORMALIZE → COMPARE → KNOWLEDGE BASE
 - Détection de changements par hash SHA256
 - Base de connaissances versionnée avec historique configurable (par nombre de versions)
 - Système d'événements (EventBus) synchrone in-process
@@ -159,7 +159,7 @@ Le cycle d'exécution complet est le suivant :
 │   ├── system_adapter.py          # Couche d'abstraction — TOUS les appels système
 │   ├── event_bus.py               # Bus d'événements synchrone in-process (pub/sub)
 │   ├── registry.py                # Registre dynamique des collecteurs découverts
-│   ├── pipeline.py                # Orchestrateur des 4 phases
+│   ├── pipeline.py                # Orchestrateur des 5 phases
 │   ├── config_loader.py           # Chargement + validation Pydantic de config.yaml
 │   ├── schemas.py                 # Schémas Pydantic pour les JSON de collecteur
 │   ├── logger.py                  # Logger structuré NDJSON → /var/log/aicollector/
@@ -198,6 +198,7 @@ Le cycle d'exécution complet est le suivant :
 └── config.yaml                    # Configuration utilisateur (YAML)
 
 /var/lib/aicollector/              # Données persistantes CRITIQUES
+│   └── .aicollector_uuid           # UUIDv4 du serveur, permissions 0o600
 │
 ├── manifest.json                  # Index global (runs, global_hash, server_uuid)
 ├── knowledge/                     # Dernier snapshot de chaque collecteur
@@ -262,6 +263,7 @@ Pour développer, tester et débugger sans droits root ni installation système,
 | `/var/lib/aicollector/knowledge/` | `./data/knowledge/` |
 | `/var/lib/aicollector/history/` | `./data/history/` |
 | `/var/lib/aicollector/changes/` | `./data/changes/` |
+| `/var/lib/aicollector/.aicollector_uuid` | `./data/.aicollector_uuid` |
 | `/var/cache/aicollector/cache/` | `./data/cache/` |
 | `/var/log/aicollector/` | `./logs/` |
 | `/run/aicollector/aicollector.lock` | `./data/aicollector.lock` |
@@ -278,7 +280,7 @@ Pour développer, tester et débugger sans droits root ni installation système,
 | `/opt/aicollector/core/system_adapter.py` | **Seule** interface entre le code et l'OS. Méthodes : `run_command()`, `read_proc_file()`, `read_sys_file()`, `list_directory()`. Tous les collecteurs passent par lui — jamais d'appel subprocess direct. |
 | `/opt/aicollector/core/event_bus.py` | Bus d'événements synchrone in-process. Les subscribers s'enregistrent par type d'événement. Découple les collecteurs, le comparateur, et les futurs "réactions" (ex: alerte IA sur changement critique). Désactivable via config. |
 | `/opt/aicollector/core/registry.py` | Registre singleton des collecteurs découverts. Méthodes : `register()`, `get_collector()`, `list_collectors()`. |
-| `/opt/aicollector/core/pipeline.py` | Orchestrateur. Coordonne les 4 phases dans l'ordre. Gère l'arrêt propre en cas d'erreur d'un collecteur. |
+| `/opt/aicollector/core/pipeline.py` | Orchestrateur. Coordonne les 5 phases dans l'ordre. Gère l'arrêt propre en cas d'erreur d'un collecteur. |
 | `/opt/aicollector/core/config_loader.py` | Charge `/etc/aicollector/config.yaml`, valide avec Pydantic, résout les chemins selon le mode (dev/prod) via `AICOLLECTOR_ROOT`. |
 | `/opt/aicollector/core/lockfile.py` | Gère `/run/aicollector/aicollector.lock` (verrou anti-concurrent). Vérifie les PID morts. |
 | `/opt/aicollector/core/knowledge_store.py` | Lecture / écriture de `/var/lib/aicollector/knowledge/` et `/var/lib/aicollector/history/`. Gère la rotation FIFO. |
@@ -346,7 +348,7 @@ collector.py --run
 | `core/system_adapter.py` | **Seule** interface entre le code et le système d'exploitation. Méthodes : `run_command()`, `read_proc_file()`, `read_sys_file()`, `list_directory()`. |
 | `core/event_bus.py` | Bus d'événements synchrone in-process. Les subscribers (logger, etc.) s'enregistrent par type d'événement. |
 | `core/registry.py` | Registre singleton des collecteurs découverts. Méthodes : `register()`, `get_collector()`, `list_collectors()`. |
-| `core/pipeline.py` | Orchestrateur. Coordonne les 4 phases dans l'ordre. Gère l'arrêt propre en cas d'erreur. |
+| `core/pipeline.py` | Orchestrateur. Coordonne les 5 phases dans l'ordre. Gère l'arrêt propre en cas d'erreur. |
 | `core/config_loader.py` | Charge `config.yaml`, valide avec Pydantic, expose un objet config typé. |
 | `core/schemas.py` | Définit les modèles Pydantic (RootModel / BaseModel) pour les JSON produits par les collecteurs. |
 | `core/logger.py` | Configure le logger Python (niveau, format JSON, rotation). S'abonne à l'EventBus pour journaliser tous les événements. |
@@ -371,7 +373,7 @@ collector.py (entry point)
     │
     ├── config_loader.py → Charge et valide config.yaml
     ├── lockfile.py      → Acquiert le verrou (quitearly si déjà locké)
-    └── pipeline.py      → Exécute les 4 phases
+    └── pipeline.py      → Exécute les 5 phases
               │
               ├─ Phase COLLECT
               │     registry.py (auto-discover) → charge tous les collecteurs
@@ -694,7 +696,7 @@ class Registry:
 
 ### 3.6 `core/pipeline.py`
 
-**Rôle :** Orchestrateur principal. Coordonne les 4 phases dans l'ordre, gère les erreurs globales, expose les statistiques de run.
+**Rôle :** Orchestrateur principal. Coordonne les 5 phases dans l'ordre (Phase 0 + 4 phases principales), gère les erreurs globales, expose les statistiques de run.
 
 **Entrées :** Configuration validée, lockfile acquis.
 
@@ -705,20 +707,29 @@ class Registry:
 **Flux détaillé par phase :**
 
 ```
-Phase COLLECT :
+Phase 0 — INITIALIZE METADATA :
+  → system_adapter.get_server_uuid()
+       → Lit /var/lib/aicollector/.aicollector_uuid (ou dev path)
+       → Valide le format UUIDv4 (36 caractères hex avec tirets)
+       → Si absent ou invalide : génère UUIDv4, écrit fichier 0o600
+  → Stocke self._server_uuid pour propagation dans les documents
+  → émet "run.started" sur l'EventBus
+  → Passe à Phase 1 COLLECT
+
+Phase 1 — COLLECT :
   → registry.discover()
   → registry.list_collectors() → pour chaque collecteur (séquentiel) :
        system_adapter.run_command() via le collecteur
        CollectorResult → emit("collector.finished")
        Stats cumulées (execution_time_ms)
 
-Phase NORMALIZE :
+Phase 2 — NORMALIZE :
   → schemas.py : validation Pydantic de chaque CollectorResult.data
   → hashing.compute_json_hash() : SHA256 sur JSON canonique
   → sanitizer.sanitize() : nettoyage anti-secrets
-  → Assemblage du JSON final avec métadonnées
+  → Assemblage du JSON final avec métadonnées (run_id, server_uuid, timestamp_utc)
 
-Phase COMPARE :
+Phase 3 — COMPARE :
   → knowledge_store.read_manifest()
   → Pour chaque collecteur normalisé :
        diff_engine.compare(old_data, new_data)
@@ -726,7 +737,7 @@ Phase COMPARE :
        → Écrit changes/<timestamp>.json
   → Écrit changes/manifest.json
 
-Phase KNOWLEDGE BASE :
+Phase 4 — KNOWLEDGE BASE :
   → Pour chaque collecteur :
        knowledge_store.write_knowledge()
        history_store.rotate_and_prune()
@@ -734,6 +745,15 @@ Phase KNOWLEDGE BASE :
   → Purge changes/ (FIFO retention)
   → emit("run.finished")
 ```
+
+**Gestion résiliente de l'UUID du serveur :**
+
+L'UUID du serveur est récupéré via `SystemAdapter.get_server_uuid()` en Phase 0. Ce mécanisme garantit :
+
+- **Persistance** : L'UUID est stocké dans `/var/lib/aicollector/.aicollector_uuid` (mode production) ou `$AICOLLECTOR_ROOT/.aicollector_uuid` (mode dev).
+- **Auto-guérison** : Si le fichier est absent, corrompu, ou contient un UUID non conforme, la méthode le régénère automatiquement, l'écrit avec les permissions `0o600`, et poursuit l'exécution.
+- **Validation stricte** : Seuls les UUIDv4 valides sont acceptés (format `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`).
+- **Propagation** : L'UUID résolu est stocké dans `self._server_uuid` et injecté dans tous les documents normalisés de Phase 2.
 
 **Statistiques de run :**
 
@@ -2890,7 +2910,7 @@ tests/
 ### V0.1 — Fondation technique ⏱ Objectif : 2 semaines
 
 **Fonctionnalités :**
-- [ ] Architecture pipeline 4 phases (COLLECT → NORMALIZE → COMPARE → KNOWLEDGE BASE)
+- [x] Architecture pipeline 5 phases (INITIALIZE METADATA → COLLECT → NORMALIZE → COMPARE → KNOWLEDGE BASE)
 - [ ] Registre dynamique de collecteurs avec `@register_collector`
 - [ ] SystemAdapter avec whitelist de commandes et cache intra-run
 - [ ] EventBus synchrone in-process
@@ -3341,7 +3361,7 @@ Les analyses critiques des modules suivants ont été réalisées :
 | Terme | Définition |
 |---|---|
 | **Collector** | Plugin qui implémente `BaseCollector` et collecte un type d'information système |
-| **Pipeline** | Orchestrateur des 4 phases (COLLECT → NORMALIZE → COMPARE → KNOWLEDGE BASE) |
+| **Pipeline** | Orchestrateur des 5 phases (COLLECT → NORMALIZE → COMPARE → KNOWLEDGE BASE) |
 | **SystemAdapter** | Couche d'abstraction qui intercepte tous les appels système |
 | **EventBus** | Bus d'événements synchrone in-process |
 | **Knowledge Base** | Base de connaissances persistée dans `knowledge/` |
