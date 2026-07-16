@@ -757,4 +757,65 @@ _ensure_dir(os.path.join(self.history_dir, collector_name))
 **Contexte technique :** `os.makedirs(path, exist_ok=True)` est idempotent : appeler cette fonction sur un repertoire deja existant ne produit aucune erreur. Cette approche est preferee a `os.mkdir` qui echoue si le repertoire existe deja.
 
 
+## Decision #29
+
+| Champ | Valeur |
+|---|---|
+| **Date** | 2026-07-16 |
+| **Sujet** | Gestion résiliente et sécurisée de l'UUID du serveur |
+| **Statut** | **ACTIVE** |
+
+**Architecture d'UUID serveur résilient avec auto-guérison :**
+
+L'UUID du serveur est géré par `SystemAdapter.get_server_uuid()` (méthode statique) et persisté dans le fichier `/var/lib/aicollector/.aicollector_uuid` avec les permissions `0o600` (lecture/écriture owner only). Le Pipeline récupère cet UUID via `SystemAdapter.get_server_uuid()` lors de la Phase 0 (Initialize Metadata) et le propage dans tous les documents normalisés via l'attribut d'instance `self._server_uuid`.
+
+**Justification :**
+
+- **Fiabilité** : Le fichier UUID est persisté sur le disque — il survit aux redémarrages et aux mises à jour du programme.
+- **Auto-guérison** : Si le fichier est absent, corrompu, ou contient un UUID invalide, la méthode le régénère automatiquement et l'écrit sur le disque, puis poursuit l'exécution.
+- **Sécurité** : Les permissions `0o600` empêchent tout utilisateur autre que le owner de lire l'UUID, protégeant ainsi l'identité du serveur contre les accès non autorisés.
+- **Pipeline résilient** : Le pipeline exécute la vérification de l'UUID en Phase 0 (Initialize Metadata) avant toute collecte. Si la récupération/génération échoue, le run est interrompu avec un message d'erreur explicite.
+- **Intégration avec `install.sh`** : Le script d'installation génère déjà un UUID valide dans le fichier. Cette méthode le lit simplement sans rien modifier — aucune régression.
+
+**Contexte technique :**
+
+```python
+# Emplacement du fichier UUID
+UUID_FILE_PATH = "/var/lib/aicollector/.aicollector_uuid"
+# Mode dev : redirection vers le répertoire de développement
+if dev_root:
+    uuid_file = dev_root / ".aicollector_uuid"
+# Permissions sécurisées : owner only
+os.chmod(uuid_file, 0o600)
+```
+
+**Flux dans le pipeline :**
+
+```
+Phase 0 — INITIALIZE METADATA :
+  → SystemAdapter.get_server_uuid()
+     → Lit /var/lib/aicollector/.aicollector_uuid
+     → Valide le format UUIDv4
+     → Si absent ou invalide : génère, écrit avec permissions 0o600
+  → Stocke self._server_uuid pour propagation
+  → Passe à Phase 1 COLLECT
+```
+
+**Nouvelle entrée dans `core/system_adapter.py` :**
+
+```python
+@staticmethod
+def get_server_uuid() -> str:
+    """Récupère ou génère l'UUID du serveur de façon résiliente."""
+    # Lecture du fichier, validation UUIDv4, auto-guérison
+    # Retourne un UUIDv4 valide (36 caractères hex avec tirets)
+```
+
+**Impact :**
+- Les documents JSON normalisés incluent systématiquement un `server_uuid` valide.
+- La configuration `config.yaml` peut contenir `server_uuid: null` — le pipeline l'ignore et utilise la valeur résiliente.
+- Aucune modification des collecteurs existants requise.
+
+---
+
 *Derniere mise a jour : 2026-07-16*
