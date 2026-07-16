@@ -9,6 +9,7 @@ import os
 import subprocess
 import time
 import logging
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Final
@@ -71,6 +72,49 @@ class SystemAdapter:
         self._forbidden_substrings: list[str] = [
             "/etc/shadow", "/etc/gshadow", "/root/.ssh", "/home/", ".env", "id_rsa"
         ]
+
+    @staticmethod
+    def get_server_uuid(uuid_path: str = "/var/lib/aicollector/.aicollector_uuid") -> str:
+        """Retrieve or generate the persistent, unique server UUID.
+
+        Checks the target path, validates that it is a valid UUIDv4, and falls back
+        to generation (auto-healing) if missing or malformed [13.6].
+        """
+        # Support redirect root during development/testing
+        root_dir = os.environ.get("AICOLLECTOR_ROOT")
+        if root_dir:
+            uuid_path = str(Path(root_dir) / "var" / "lib" / "aicollector" / ".aicollector_uuid")
+
+        path = Path(uuid_path)
+
+        if path.exists():
+            try:
+                candidate = path.read_text(encoding="utf-8").strip()
+                # Strict UUID v4 check
+                uuid.UUID(candidate, version=4)
+                return candidate
+            except (ValueError, OSError) as exc:
+                logger.warning(
+                    f"Persistent UUID at {uuid_path} was invalid or unreadable ({exc}). "
+                    "Initiating auto-healing regeneration [13.6]."
+                )
+
+        # Fallback & auto-healing: generate and attempt to persist with strict permissions
+        try:
+            new_uuid = str(uuid.uuid4())
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(new_uuid, encoding="utf-8")
+            
+            try:
+                path.chmod(0o600)  # Restricted read/write for owner only
+            except OSError as chmod_exc:
+                logger.warning(f"Could not apply chmod 600 to {uuid_path}: {chmod_exc}")
+                
+            logger.info(f"Successfully generated and persisted new server UUID: {new_uuid}")
+            return new_uuid
+        except OSError as exc:
+            logger.error(f"Critical error: Failed to write system UUID to {uuid_path}: {exc}")
+            raise RuntimeError(f"Fichier d'UUID serveur introuvable et impossible à créer : {exc}")
 
     def _validate_safe_args(self, cmd: str, args: list[str]) -> None:
         """Analyze arguments to prevent shell bypass/injection."""
