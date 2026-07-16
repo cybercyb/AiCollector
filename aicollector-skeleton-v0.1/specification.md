@@ -1,4 +1,4 @@
-[SPECIFICATION V1.2.md](https://github.com/user-attachments/files/30080781/SPECIFICATION.V1.2.md)
+[SPECIFICATION V1.2.md](https://github.com/user-attachments/files/30080800/SPECIFICATION.V1.2.md)
 > **STATUT : VERSION FIGÉE ET VALIDÉE — Référence technique absolue du projet. Toute modification future doit d'abord être répercutée ici avant toute modification du code.**  
 > **Date de verrouillage :** 5 juillet 2026 — Version verrouillée par le client après revue complète.
 
@@ -512,9 +512,32 @@ Le premier mot de toute commande est validé contre `ALLOWED_COMMANDS`. Si la co
 
 ---
 
-**Sécurité — Couche 2 : Validation stricte des arguments (Décision #8)**
+**Sécurité — Couche 2 : Validation des arguments en deux filtres (Décision #22)**
 
-Tous les éléments de `args` sont validés avant exécution via regex `^[a-zA-Z0-9./_:-]+$`. Tout métacaractère shell suspect (`` &`$\|><"' ;$( ``) → `ForbiddenCommandError`.
+Tous les éléments de `args` sont validés avant exécution en **deux filtres indépendants** pour éviter les faux positifs (comme le blocage de `--show` qui contient la sous-chaîne `sh`) :
+
+**Filtre A — Sous-chaînes interdites** (`DANGEROUS_SUBSTRING_PATTERNS`, vérifié par `pattern in lower_arg`) :
+```
+"-exec", "system", "eval", ">=", "<=", "|", ";", "&&", "||"
+```
+→ Capture les opérateurs de contrôle shell, redirections, et motifs d'exécution (`-exec`, `system`, `eval`) qui détourneraient une commande whitelistée.
+
+**Filtre B — Exécutables interdits** (`DANGEROUS_EXECUTABLE_NAMES`, vérifié par `exact match` ou `/suffix`) :
+```
+"sh", "bash", "python", "perl", "ruby", "php",
+"nc", "ncat", "curl", "wget"
+```
+→ Interdit les interpréteurs et outils réseau suspects. Le motif `sh` est vérifié **exactement** (ou en `/sh` suffix), donc `--show`, `da**sh**`, `bu**sh**` passent sans être bloqués.
+
+**Règle de décision :**
+```
+Si arg.lower() contient un motif de DANGEROUS_SUBSTRING_PATTERNS → BLOQUÉ
+Si arg.lower() est dans DANGEROUS_EXECUTABLE_NAMES (exact) → BLOQUÉ
+Si arg.endswith('/sh') → BLOQUÉ
+Sinon → AUTORISÉ
+```
+
+Tout motif détecté → `ForbiddenCommandError` immédiate.
 
 ---
 
