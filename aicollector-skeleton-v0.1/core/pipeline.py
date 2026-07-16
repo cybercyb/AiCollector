@@ -197,20 +197,23 @@ class Pipeline:
                 # 1. Désinfection en profondeur contre la fuite de secrets
                 sanitized_content = self._sanitizer.sanitize(raw_result.data)
                 
-                # Récupération sécurisée avec valeurs par défaut (CollectorResult n'expose pas directement ces propriétés)
+                # Récupération sécurisée avec valeurs par défaut
                 confidence_score = getattr(raw_result, "confidence_score", None)
                 dependencies = getattr(raw_result, "dependencies", [])
                 
-                # Convertir les erreurs structurées du collecteur en listes de chaînes de caractères pour les schémas
+                # Convertir les erreurs structurées du collecteur en listes de chaînes
                 raw_errors = getattr(raw_result, "errors", [])
                 string_errors = [str(err) for err in raw_errors] if raw_errors else []
 
-                # 2. Construction de l'enveloppe commune standardisée
+                # Formatage strict du timestamp sans microsecondes (ex: 2026-07-16T09:12:22Z)
+                timestamp_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+                # 2. Construction de l'enveloppe commune standardisée (sans hash initial pour le calculer de façon propre)
                 normalized_doc = {
                     "schema_version": getattr(collector, "schema_version", "1.0"),
                     "collector_version": getattr(collector, "collector_version", "1.0.0"),
                     "server_uuid": self._config.server_uuid or "00000000-0000-0000-0000-000000000000",
-                    "timestamp_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "timestamp_utc": timestamp_utc,
                     "source": name,
                     "content": sanitized_content,
                     "confidence_score": confidence_score,
@@ -223,7 +226,7 @@ class Pipeline:
                     } if hasattr(collector, "capabilities") and collector.capabilities() else None
                 }
                 
-                # 3. Calcul et inclusion du hash canonique final (préfixe sha256:)
+                # 3. Calcul du hash canonique du document (compute_json_hash fournit l'hexadécimal pur)
                 doc_hash = f"sha256:{compute_json_hash(normalized_doc)}"
                 normalized_doc["hash"] = doc_hash
                 
@@ -249,7 +252,7 @@ class Pipeline:
                     "error_message": f"Normalization or schema validation failed: {exc}"
                 }))
                 logger.error("Failed to normalize collector '%s': %s", name, exc, exc_info=True)
-
+                
     # ── Phase 3: COMPARE ────────────────────────────────────────────────────
 
     def _phase_compare(self, run_id: str) -> list[dict[str, Any]]:
