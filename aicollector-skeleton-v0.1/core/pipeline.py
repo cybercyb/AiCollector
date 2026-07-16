@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field, replace
@@ -38,6 +39,7 @@ from core.exceptions import (
     AICollectorError,
     CollectorError,
     CollectorTimeoutError,
+    PipelineError,
 )
 
 logger = logging.getLogger("aicollector")
@@ -76,6 +78,27 @@ class Pipeline:
         self._raw_results: dict[str, CollectorResult] = {}
         self._normalized_snapshots: dict[str, dict[str, Any]] = {}
         self._stats: PipelineStats | None = None
+        self._server_uuid: str | None = None
+
+    def _initialize_server_uuid(self) -> None:
+        """Resolve and validate host's persistent server UUID via SystemAdapter."""
+        try:
+            # 1. Détermination résiliente du chemin du fichier d'UUID
+            # En tenant compte d'un chemin configuré (ex: config.paths.base_dir) ou du standard FHS
+            uuid_path = "/var/lib/aicollector/.aicollector_uuid"
+            
+            if hasattr(self._config, "paths") and hasattr(self._config.paths, "base_dir"):
+                uuid_path = os.path.join(self._config.paths.base_dir, ".aicollector_uuid")
+            elif "AICOLLECTOR_ROOT" in os.environ:
+                uuid_path = os.path.join(os.environ["AICOLLECTOR_ROOT"], "var/lib/aicollector/.aicollector_uuid")
+
+            # 2. Appel à l'adaptateur système (gérant de manière sûre l'écriture/lecture et la structure)
+            self._server_uuid = SystemAdapter.get_server_uuid(uuid_path)
+            logger.info("Server UUID successfully resolved: %s", self._server_uuid)
+
+        except Exception as exc:
+            logger.critical("Critical failure initializing persistent server UUID: %s", exc)
+            raise PipelineError(f"Cannot initialize pipeline metadata: {exc}") from exc
 
     def run(self) -> PipelineStats:
         """Execute the full pipeline.
@@ -93,6 +116,9 @@ class Pipeline:
 
         success = False
         try:
+            # Phase 0 — INITIALIZE METADATA (Vérification et validation de l'UUID hôte)
+            self._initialize_server_uuid()
+
             # Phase 1 — COLLECT
             self._phase_collect(run_id)
 
@@ -208,11 +234,14 @@ class Pipeline:
                 # Formatage strict du timestamp sans microsecondes (ex: 2026-07-16T09:12:22Z)
                 timestamp_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-                # 2. Construction de l'enveloppe commune standardisée (sans hash initial pour le calculer de façon propre)
+                # 2. Construction de l'enveloppe commune standardisée (sans hash initial)
+                # Utilisation de l'UUID persistant résolu par la Phase 0 (avec fallback sécurisé au cas où)
+                resolved_uuid = self._server_uuid or self._config.server_uuid or "00000000-0000-0000-0000-000000000000"
+                
                 normalized_doc = {
                     "schema_version": getattr(collector, "schema_version", "1.0"),
                     "collector_version": getattr(collector, "collector_version", "1.0.0"),
-                    "server_uuid": self._config.server_uuid or "00000000-0000-0000-0000-000000000000",
+                    "server_uuid": resolved_uuid,
                     "timestamp_utc": timestamp_utc,
                     "source": name,
                     "content": sanitized_content,
