@@ -226,8 +226,8 @@ class Pipeline:
                     } if hasattr(collector, "capabilities") and collector.capabilities() else None
                 }
                 
-                # 3. Calcul du hash canonique du document (compute_json_hash fournit l'hexadécimal pur)
-                doc_hash = f"sha256:{compute_json_hash(normalized_doc)}"
+                # 3. Calcul du hash canonique du document (qui inclut déjà le préfixe 'sha256:')
+                doc_hash = compute_json_hash(normalized_doc)
                 normalized_doc["hash"] = doc_hash
                 
                 # 4. Validation stricte du format final par schéma Pydantic
@@ -280,10 +280,11 @@ class Pipeline:
             highest_severity = Severity.INFO
             
             for change in raw_changes:
-                if change.severity == Severity.WARNING and highest_severity == Severity.INFO:
+                if change.severity == Severity.CRITICAL:
+                    highest_severity = Severity.CRITICAL
+                    break
+                elif change.severity == Severity.WARNING:
                     highest_severity = Severity.WARNING
-                elif change.severity == Severity.ERROR:
-                    highest_severity = Severity.ERROR
                 
                 serialized_changes.append({
                     "type": str(change.change_type),
