@@ -1,10 +1,11 @@
+# /opt/aicollector/core/pipeline.py
 """Four-phase pipeline orchestrator."""
 from __future__ import annotations
 
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field, replace  # Ajout de replace pour les frozen dataclasses
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -15,7 +16,6 @@ from core.base_collector import (
     CollectorCapabilities,
     Severity,
 )
-# Correction de l'import : importation des constantes d'événements
 from core.event_bus import (
     EventBus,
     Event,
@@ -28,11 +28,12 @@ from core.event_bus import (
 )
 from core.registry import Registry
 from core.system_adapter import SystemAdapter
-from core.diff_engine import DiffEngine
+from core.diff_engine import DiffEngine, ChangeType
 from core.sanitizer import Sanitizer
 from core.knowledge_store import KnowledgeStore
 from core.config_loader import AICollectorConfig
 from core.hashing import compute_json_hash
+from core.schemas import validate_knowledge_json
 from core.exceptions import (
     AICollectorError,
     CollectorError,
@@ -71,9 +72,9 @@ class Pipeline:
         self._diff_engine = DiffEngine()
         self._sanitizer = Sanitizer(event_bus)
         
-        # On va stocker les instances de collecteurs ET leurs résultats bruts
         self._collectors: list[BaseCollector] = []
         self._raw_results: dict[str, CollectorResult] = {}
+        self._normalized_snapshots: dict[str, dict[str, Any]] = {}
         self._stats: PipelineStats | None = None
 
     def run(self) -> PipelineStats:
@@ -83,8 +84,8 @@ class Pipeline:
             PipelineStats for the completed run.
         """
         run_id = str(uuid.uuid4())
-        started_at = datetime.now(timezone.utc).isoformat()
-        start_time_mono = time.monotonic()  # Pour un calcul de durée précis et robuste
+        started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        start_time_mono = time.monotonic()
         
         self._stats = PipelineStats(run_id=run_id, started_at=started_at)
         logger.info("Pipeline run started", extra={"run_id": run_id})
@@ -107,7 +108,6 @@ class Pipeline:
             success = True
 
         except Exception as exc:  # noqa: BLE001
-            # Événement run.failed requis par la spécification
             self._event_bus.emit(Event(RUN_FAILED, {
                 "run_id": run_id,
                 "error_type": exc.__class__.__name__,
@@ -116,10 +116,9 @@ class Pipeline:
             logger.error("Pipeline run failed: %s", exc, exc_info=True)
             raise
         finally:
-            finished_at = datetime.now(timezone.utc).isoformat()
+            finished_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             duration_ms = (time.monotonic() - start_time_mono) * 1000
             
-            # Mise à jour propre du frozen dataclass avec 'replace'
             if self._stats:
                 self._stats = replace(
                     self._stats,
@@ -134,6 +133,7 @@ class Pipeline:
                     "stats": {
                         "collectors_run": self._stats.collectors_run if self._stats else 0,
                         "collectors_failed": self._stats.collectors_failed if self._stats else 0,
+                        "changes_detected": self._stats.changes_detected if self._stats else 0,
                     }
                 }))
 
@@ -157,26 +157,20 @@ class Pipeline:
                 {"collector_name": name, "run_id": run_id}
             ))
             
-            # Mise à jour statistique (utilisation sécurisée de replace)
             if self._stats:
                 self._stats = replace(self._stats, collectors_run=self._stats.collectors_run + 1)
                 
             try:
-                # 1. Instanciation
                 collector = Registry.get_collector(name)
                 self._collectors.append(collector)
                 
-                # 2. Exécution de la collecte (Correction de l'omission majeure)
-                # Note : Le timeout est géré au niveau du collecteur ou du system_adapter
                 result = collector.collect(self._system_adapter)
                 self._raw_results[name] = result
                 
-                # Si le collecteur renvoie des erreurs internes non-bloquantes
                 if result.errors:
                     logger.warning("Collector '%s' completed with non-blocking errors", name)
 
             except Exception as exc:  # noqa: BLE001
-                # Gestion de l'échec d'un collecteur individuel
                 if self._stats:
                     self._stats = replace(self._stats, collectors_failed=self._stats.collectors_failed + 1)
                 
@@ -192,25 +186,137 @@ class Pipeline:
 
     def _phase_normalize(self, run_id: str) -> None:
         """Validate, sanitize, and hash each collector result."""
-        # TODO: Implémenter la normalisation par schéma Pydantic
         for collector in self._collectors:
-            if collector.name not in self._raw_results:
+            name = collector.name
+            if name not in self._raw_results:
                 continue
                 
-            # Ici s'exécutera la sanitization et la validation
-            # self._sanitizer.sanitize(...)
+            raw_result = self._raw_results[name]
             
-            self._event_bus.emit(Event(
-                COLLECTOR_FINISHED,
-                {"collector_name": collector.name, "run_id": run_id}
-            ))
+            try:
+                # 1. Désinfection en profondeur contre la fuite de secrets
+                sanitized_content = self._sanitizer.sanitize(raw_result.data)
+                
+                # 2. Construction de l'enveloppe commune standardisée
+                normalized_doc = {
+                    "schema_version": getattr(collector, "schema_version", "1.0"),
+                    "collector_version": getattr(collector, "version", "1.0.0"),
+                    "server_uuid": self._config.server_uuid or "00000000-0000-0000-0000-000000000000",
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "source": name,
+                    # Le calcul du hash s'effectue temporairement sans la clé 'hash' pour rester déterministe
+                    "content": sanitized_content,
+                    "confidence_score": raw_result.confidence_score,
+                    "dependencies": raw_result.dependencies,
+                    "inconsistencies_detected": raw_result.errors,
+                    "capabilities": {
+                        "supported_platforms": collector.capabilities.supported_platforms,
+                        "min_confidence": collector.capabilities.min_confidence,
+                        "known_inconsistencies": collector.capabilities.known_inconsistencies,
+                    } if collector.capabilities else None
+                }
+                
+                # 3. Calcul et inclusion du hash canonique final (préfixe sha256:)
+                doc_hash = f"sha256:{compute_json_hash(normalized_doc)}"
+                normalized_doc["hash"] = doc_hash
+                
+                # 4. Validation stricte du format final par schéma Pydantic
+                validate_knowledge_json(normalized_doc)
+                
+                # Sauvegarde en mémoire pour les phases suivantes
+                self._normalized_snapshots[name] = normalized_doc
+                
+                self._event_bus.emit(Event(
+                    COLLECTOR_FINISHED,
+                    {"collector_name": name, "run_id": run_id}
+                ))
+                
+            except Exception as exc:  # noqa: BLE001
+                if self._stats:
+                    self._stats = replace(self._stats, collectors_failed=self._stats.collectors_failed + 1)
+                
+                self._event_bus.emit(Event(COLLECTOR_FAILED, {
+                    "collector_name": name,
+                    "run_id": run_id,
+                    "error_type": "NormalizationError",
+                    "error_message": f"Normalization or schema validation failed: {exc}"
+                }))
+                logger.error("Failed to normalize collector '%s': %s", name, exc)
 
     # ── Phase 3: COMPARE ────────────────────────────────────────────────────
 
     def _phase_compare(self, run_id: str) -> list[dict[str, Any]]:
         """Diff current vs previous snapshots and emit change events."""
-        # TODO: implement full diff + change detection
-        return []
+        all_change_events: list[dict[str, Any]] = []
+        
+        for name, current_doc in self._normalized_snapshots.items():
+            # Lecture de la dernière connaissance enregistrée (si présente)
+            previous_doc = self._knowledge_store.read_knowledge(name)
+            if not previous_doc:
+                # Premier enregistrement : Aucun historique de comparaison à exécuter
+                continue
+            
+            # Comparaison des contenus avec le DiffEngine
+            raw_changes = self._diff_engine.compare(
+                old_data=previous_doc,
+                new_data=current_doc,
+                # On utilise la méthode de classification du collecteur si disponible
+                classify_fn=getattr(Registry.get_collector(name), "classify_change", None)
+            )
+            
+            if not raw_changes:
+                continue
+                
+            # Regroupement des changements dans un événement de changement global pour ce collecteur
+            change_id = str(uuid.uuid4())
+            timestamp_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            
+            serialized_changes = []
+            highest_severity = Severity.INFO
+            
+            for change in raw_changes:
+                # Détermination de la sévérité maximale pour évaluer la criticité du changement
+                if change.severity == Severity.WARNING and highest_severity == Severity.INFO:
+                    highest_severity = Severity.WARNING
+                elif change.severity == Severity.ERROR:
+                    highest_severity = Severity.ERROR
+                
+                serialized_changes.append({
+                    "type": str(change.change_type),
+                    "path": change.path,
+                    "description": f"Value changed at path: {change.path}",
+                    "old_value_hash": f"sha256:{compute_json_hash({'v': change.old_value})}" if change.old_value is not None else None,
+                    "new_value_hash": f"sha256:{compute_json_hash({'v': change.new_value})}" if change.new_value is not None else None,
+                    "severity": str(change.severity),
+                })
+                
+            change_event = {
+                "schema_version": "1.0",
+                "change_id": change_id,
+                "run_id": run_id,
+                "timestamp_utc": timestamp_utc,
+                "collector": name,
+                "severity": str(highest_severity),
+                "summary": f"{len(raw_changes)} change(s) detected in collector '{name}'",
+                "total_changes": len(raw_changes),
+                "changes": serialized_changes,
+            }
+            
+            all_change_events.append(change_event)
+            
+            # Mise à jour statistique
+            if self._stats:
+                self._stats = replace(self._stats, changes_detected=self._stats.changes_detected + len(raw_changes))
+            
+            # Émission de l'événement sur le bus
+            self._event_bus.emit(Event("change_detected", {
+                "collector_name": name,
+                "change_id": change_id,
+                "severity": str(highest_severity),
+                "total_changes": len(raw_changes),
+            }))
+            
+        return all_change_events
 
     # ── Phase 4: KNOWLEDGE BASE ─────────────────────────────────────────────
 
@@ -220,8 +326,22 @@ class Pipeline:
         changes: list[dict[str, Any]],
     ) -> None:
         """Persist normalised JSONs, rotate history, prune changes."""
-        # TODO: write knowledge JSONs, rotate history, prune FIFO
-        pass
+        # 1. Écriture des connaissances normalisées et rotation FIFO de l'historique
+        for name, doc in self._normalized_snapshots.items():
+            # Écrit dans /var/lib/aicollector/knowledge/<name>.json et met à jour manifest.json
+            self._knowledge_store.write_knowledge(name, doc)
+            
+            # Historisation FIFO (limite par défaut à 50 versions, paramétrable depuis config)
+            max_versions = self._config.retention.history_versions if hasattr(self._config, "retention") else 50
+            self._knowledge_store.rotate_history(name, doc, max_versions=max_versions)
+            
+        # 2. Écriture des événements de changement détectés
+        for change_doc in changes:
+            self._knowledge_store.write_change(change_doc)
+            
+        # 3. Purge des anciens changements selon les règles de rétention
+        max_changes = self._config.retention.change_events if hasattr(self._config, "retention") else 200
+        self._knowledge_store.prune_changes(keep=max_changes)
 
     @property
     def stats(self) -> PipelineStats | None:
