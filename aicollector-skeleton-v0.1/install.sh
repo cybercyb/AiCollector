@@ -22,6 +22,7 @@ UNIT_DIR="/etc/systemd/system"
 DEFAULT_SCHEDULE="0 */2 * * *"  # Every 2 hours
 USER_NAME="${APP_NAME}"
 GROUP_NAME="${APP_NAME}"
+UUID_FILE="${LIB_DIR}/.aicollector_uuid"
 
 # ── Colour helpers ──────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -198,6 +199,7 @@ install_step2_dependencies() {
         "systemd"
         "python3"
         "python3-yaml"
+        "uuid-runtime" # Ajout de uuidgen pour une génération UUID système robuste
     )
 
     local install_status=0
@@ -269,9 +271,9 @@ install_step3_user() {
     fi
 }
 
-# ── Step 4: Create directory structure ──────────────────────────────────────────
+# ── Step 4: Create directory structure & Generate Server UUID ──────────────────
 install_step4_directories() {
-    log_step 4 10 "Configuring directory layout"
+    log_step 4 10 "Configuring directory layout and UUID generation"
 
     local dirs=(
         "${INSTALL_DIR}"
@@ -297,6 +299,26 @@ install_step4_directories() {
             fi
         fi
     done
+
+    # --- Gestion et création persistante de l'UUID du serveur ---
+    if [[ -f "${UUID_FILE}" ]]; then
+        local existing_uuid
+        existing_uuid=$(cat "${UUID_FILE}")
+        log_skip "Server UUID already exists: ${existing_uuid}"
+    else
+        if [[ "${DRY_RUN}" == "yes" ]]; then
+            log_dry "Would generate a new persistent Server UUID in ${UUID_FILE}"
+        else
+            local generated_uuid
+            if command -v uuidgen >/dev/null 2>&1; then
+                generated_uuid=$(uuidgen | tr '[:upper:]' '[:lower:]')
+            else
+                generated_uuid=$(python3 -c 'import uuid; print(str(uuid.uuid4()))')
+            fi
+            echo -n "${generated_uuid}" > "${UUID_FILE}"
+            log_ok "Persistent Server UUID generated: ${generated_uuid}"
+        fi
+    fi
 }
 
 # ── Step 5: Deploy application files ───────────────────────────────────────────
@@ -417,6 +439,12 @@ install_step7_permissions() {
     # Variable & State Directories
     chown -R ${USER_NAME}:${GROUP_NAME} "${LIB_DIR}"
     chmod -R 750 "${LIB_DIR}"
+
+    # S'assurer que le fichier d'UUID possède les droits stricts en lecture seule pour aicollector
+    if [[ -f "${UUID_FILE}" ]]; then
+        chown ${USER_NAME}:${GROUP_NAME} "${UUID_FILE}"
+        chmod 600 "${UUID_FILE}"
+    fi
 
     chown -R ${USER_NAME}:${GROUP_NAME} "${CACHE_DIR}"
     chmod 750 "${CACHE_DIR}"
