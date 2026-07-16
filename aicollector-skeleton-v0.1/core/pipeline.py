@@ -197,23 +197,30 @@ class Pipeline:
                 # 1. Désinfection en profondeur contre la fuite de secrets
                 sanitized_content = self._sanitizer.sanitize(raw_result.data)
                 
+                # Récupération sécurisée avec valeurs par défaut (CollectorResult n'expose pas directement ces propriétés)
+                confidence_score = getattr(raw_result, "confidence_score", None)
+                dependencies = getattr(raw_result, "dependencies", [])
+                
+                # Convertir les erreurs structurées du collecteur en listes de chaînes de caractères pour les schémas
+                raw_errors = getattr(raw_result, "errors", [])
+                string_errors = [str(err) for err in raw_errors] if raw_errors else []
+
                 # 2. Construction de l'enveloppe commune standardisée
                 normalized_doc = {
                     "schema_version": getattr(collector, "schema_version", "1.0"),
-                    "collector_version": getattr(collector, "version", "1.0.0"),
+                    "collector_version": getattr(collector, "collector_version", "1.0.0"),
                     "server_uuid": self._config.server_uuid or "00000000-0000-0000-0000-000000000000",
                     "timestamp_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     "source": name,
-                    # Le calcul du hash s'effectue temporairement sans la clé 'hash' pour rester déterministe
                     "content": sanitized_content,
-                    "confidence_score": raw_result.confidence_score,
-                    "dependencies": raw_result.dependencies,
-                    "inconsistencies_detected": raw_result.errors,
+                    "confidence_score": confidence_score,
+                    "dependencies": dependencies,
+                    "inconsistencies_detected": string_errors,
                     "capabilities": {
-                        "supported_platforms": collector.capabilities.supported_platforms,
-                        "min_confidence": collector.capabilities.min_confidence,
-                        "known_inconsistencies": collector.capabilities.known_inconsistencies,
-                    } if collector.capabilities else None
+                        "supported_platforms": collector.capabilities().supported_platforms,
+                        "min_confidence": collector.capabilities().min_confidence,
+                        "known_inconsistencies": collector.capabilities().known_inconsistencies,
+                    } if hasattr(collector, "capabilities") and collector.capabilities() else None
                 }
                 
                 # 3. Calcul et inclusion du hash canonique final (préfixe sha256:)
@@ -241,7 +248,7 @@ class Pipeline:
                     "error_type": "NormalizationError",
                     "error_message": f"Normalization or schema validation failed: {exc}"
                 }))
-                logger.error("Failed to normalize collector '%s': %s", name, exc)
+                logger.error("Failed to normalize collector '%s': %s", name, exc, exc_info=True)
 
     # ── Phase 3: COMPARE ────────────────────────────────────────────────────
 
@@ -250,24 +257,19 @@ class Pipeline:
         all_change_events: list[dict[str, Any]] = []
         
         for name, current_doc in self._normalized_snapshots.items():
-            # Lecture de la dernière connaissance enregistrée (si présente)
             previous_doc = self._knowledge_store.read_knowledge(name)
             if not previous_doc:
-                # Premier enregistrement : Aucun historique de comparaison à exécuter
                 continue
             
-            # Comparaison des contenus avec le DiffEngine
             raw_changes = self._diff_engine.compare(
                 old_data=previous_doc,
                 new_data=current_doc,
-                # On utilise la méthode de classification du collecteur si disponible
                 classify_fn=getattr(Registry.get_collector(name), "classify_change", None)
             )
             
             if not raw_changes:
                 continue
                 
-            # Regroupement des changements dans un événement de changement global pour ce collecteur
             change_id = str(uuid.uuid4())
             timestamp_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             
@@ -275,7 +277,6 @@ class Pipeline:
             highest_severity = Severity.INFO
             
             for change in raw_changes:
-                # Détermination de la sévérité maximale pour évaluer la criticité du changement
                 if change.severity == Severity.WARNING and highest_severity == Severity.INFO:
                     highest_severity = Severity.WARNING
                 elif change.severity == Severity.ERROR:
@@ -304,11 +305,9 @@ class Pipeline:
             
             all_change_events.append(change_event)
             
-            # Mise à jour statistique
             if self._stats:
                 self._stats = replace(self._stats, changes_detected=self._stats.changes_detected + len(raw_changes))
             
-            # Émission de l'événement sur le bus
             self._event_bus.emit(Event("change_detected", {
                 "collector_name": name,
                 "change_id": change_id,
@@ -326,21 +325,29 @@ class Pipeline:
         changes: list[dict[str, Any]],
     ) -> None:
         """Persist normalised JSONs, rotate history, prune changes."""
+        # Résolution résiliente et tolérante aux variations de RetentionConfig
+        max_versions = 50
+        max_changes = 200
+        
+        if hasattr(self._config, "retention") and self._config.retention is not None:
+            max_versions = getattr(self._config.retention, "history_versions", 50)
+            
+            # Recherche du paramètre de rétention pour les changements par alias probables
+            for attr in ("change_events", "changes_events", "changes", "max_changes", "keep_changes"):
+                if hasattr(self._config.retention, attr):
+                    max_changes = getattr(self._config.retention, attr)
+                    break
+        
         # 1. Écriture des connaissances normalisées et rotation FIFO de l'historique
         for name, doc in self._normalized_snapshots.items():
-            # Écrit dans /var/lib/aicollector/knowledge/<name>.json et met à jour manifest.json
             self._knowledge_store.write_knowledge(name, doc)
-            
-            # Historisation FIFO (limite par défaut à 50 versions, paramétrable depuis config)
-            max_versions = self._config.retention.history_versions if hasattr(self._config, "retention") else 50
             self._knowledge_store.rotate_history(name, doc, max_versions=max_versions)
             
         # 2. Écriture des événements de changement détectés
         for change_doc in changes:
             self._knowledge_store.write_change(change_doc)
             
-        # 3. Purge des anciens changements selon les règles de rétention
-        max_changes = self._config.retention.change_events if hasattr(self._config, "retention") else 200
+        # 3. Purge des anciens changements
         self._knowledge_store.prune_changes(keep=max_changes)
 
     @property
