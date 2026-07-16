@@ -1,11 +1,11 @@
-[SPECIFICATION V1.1.md](https://github.com/user-attachments/files/30080762/SPECIFICATION.V1.1.md)
+[SPECIFICATION V1.2.md](https://github.com/user-attachments/files/30080781/SPECIFICATION.V1.2.md)
 > **STATUT : VERSION FIGÉE ET VALIDÉE — Référence technique absolue du projet. Toute modification future doit d'abord être répercutée ici avant toute modification du code.**  
-> **Date de verrouillage :** 2026-07-07 — Version Validée par le client après revue complète.
+> **Date de verrouillage :** 5 juillet 2026 — Version verrouillée par le client après revue complète.
 
 # AICollector — Spécification Technique Complète
 
-**Version du document :** 1.1-draft  
-**Date :** 2026-07-07  
+**Version du document :** 1.3  
+**Date :** 2026-07-14  
 **cible :** Python ≥ 3.12 · Ubuntu 26.04 LTS  
 
 ---
@@ -482,13 +482,11 @@ class Severity(StrEnum):
 
 ### 3.3 `core/system_adapter.py`
 
-**Rôle :** **Couche d'abstraction unique** entre le code (collecteurs) et le système d'exploitation. Intercepte et valide TOUS les appels système. C'est le **seul** point du projet qui exécute des commandes externes ou lit des fichiers système.
+**Rôle :** **Couche d'abstraction unique** entre le code (collecteurs) et le système d'exploitation. Intercepte et valide **TOUS** les appels système. C'est le **seul** point du projet qui exécute des commandes externes ou lit des fichiers système.
 
-**Entrées :** Config (liste des commandes autorisées, cache activé/désactivé).
+**Décision d'architecture :** Conforme à la Décision #8 (durcissement complet).
 
-**Sorties :** Résultats typés (`CommandResult`, `ProcFileResult`, etc.).
-
-**Dépendances :** `subprocess`, `pathlib`, `core/exceptions.py`.
+**Dépendances :** `subprocess`, `pathlib`, `core/exceptions.py`, `signal`.
 
 **Whitelist ALLOWED_COMMANDS :**
 
@@ -500,48 +498,84 @@ ALLOWED_COMMANDS: frozenset[str] = frozenset({
     "sensors", "nproc", "hostname", "uname", "ls",
     "cat", "grep", "awk", "cut", "sort", "uniq",
     "wc", "find", "stat", "id", "whoami", "uptime",
-    "free", "df", "mount", "ps", "netstat",
+    "free", "mount", "ps",
 })
 ```
 
-> **Règle absolue :** `shell=True` est **interdit** dans tous les appels `subprocess`. Chaque commande est passée en liste d'arguments (`[cmd, arg1, arg2]`).
+> **Règle absolue :** `shell=True` est **interdit** dans tous les appels `subprocess`.
 
-**Cache intra-run :**
+---
+
+**Sécurité — Couche 1 : Whitelist de commande**
+
+Le premier mot de toute commande est validé contre `ALLOWED_COMMANDS`. Si la commande n'est pas dans la whitelist → `ForbiddenCommandError` immédiate, le run est interrompu.
+
+---
+
+**Sécurité — Couche 2 : Validation stricte des arguments (Décision #8)**
+
+Tous les éléments de `args` sont validés avant exécution via regex `^[a-zA-Z0-9./_:-]+$`. Tout métacaractère shell suspect (`` &`$\|><"' ;$( ``) → `ForbiddenCommandError`.
+
+---
+
+**Sécurité — Couche 3 : Whitelist des chemins (Décision #8)**
 
 ```python
-class SystemAdapter:
-    def __init__(self, enable_cache: bool = True):
-        self._cache: dict[str, Any] = {}  # vidé à chaque run
-        self._forbidden_paths: set[str] = {
-            "/etc/shadow", "/root/.ssh", "/home/*/.ssh",
-            "*.key", "*.pem", "*.crt",  # patterns (via fnmatch)
-        }
+_ALLOWED_PROC_PREFIXES: frozenset[str] = frozenset({
+    "/proc/", "/sys/", "/sys/class/net/",
+})
 ```
+
+Chemin hors whitelist → `ForbiddenCommandError` immédiate. Empêche la lecture de `/etc/shadow`, `/root/.ssh`, etc.
+
+---
+
+**Cache : Sécurisé et basé sur mtime (Décision #8)**
+
+```python
+def get_cached(self, path: Path) -> Any:
+    key = (path, os.stat(path).st_mtime)  # Invalidation automatique
+    if key in self._cache:
+        return self._cache[key]
+```
+
+**Pas de cache pour `run_command()`** — chaque appel reflète l'état réel du système.
+
+---
+
+**Validation PID — Technique POSIX standard**
+
+```python
+os.kill(pid, 0)              # ✅ Standard POSIX — lève OSError si PID mort/zombie
+os.kill(pid, signal.SIG_DFL) # ❌ Incorrect — SIG_DFL n'est pas un signal réel
+```
+
+---
 
 **Méthodes publiques :**
 
 | Méthode | Rôle | Retour |
 |---|---|---|
-| `run_command(cmd: str, args: list[str], timeout: int)` | Exécute une commande whitelistée | `CommandResult(stdout, stderr, returncode, elapsed_ms)` |
-| `read_proc_file(path: str)` | Lit un fichier de `/proc/` | `str` (contenu) |
-| `read_sys_file(path: str)` | Lit un fichier de `/sys/` | `str` (contenu) |
-| `list_directory(path: str, pattern: str)` | Liste un répertoire avec filtre | `list[Path]` |
-| `check_tool_available(tool: str)` | Vérifie qu'un outil estinstallé | `bool` |
+| `run_command(cmd, args, timeout)` | Commande whitelistée + args validés | `CommandResult` |
+| `read_proc_file(path)` | Lit un fichier `/proc/` whitelisté | `ProcFileResult` |
+| `read_sys_file(path)` | Lit un fichier `/sys/` whitelisté | `ProcFileResult` |
+| `list_directory(path)` | Liste un répertoire whitelisté | `list[str]` |
+| `check_tool_available(tool)` | Vérifie qu'un outil est installé | `bool` |
 
-**Validation :** Si une commande ou un chemin figure hors whitelist, `ForbiddenCommandError` est levée immédiatement et le run est interrompu.
+---
 
 **Erreurs possibles :**
 
 | Erreur | Cause | Comportement |
 |---|---|---|
-| `ForbiddenCommandError` | Commande hors whitelist | **Bloquant** — run interrompu, log FATAL, exit code 1 |
+| `ForbiddenCommandError` | Commande/argument/chemin hors whitelist | **Bloquant** — run interrompu, log FATAL, exit 1 |
 | `subprocess.TimeoutExpired` | Commande dépasse le timeout | Log WARNING, `CollectorError` dans le résultat |
-| `FileNotFoundError` | Fichier `/proc/` manquant | Log WARNING, données omises dans le résultat |
-| `PermissionError` | Accès `/proc/sys/` sans root | Log WARNING, поле ignoré, pas bloquant |
-
-**Performances attendues :** Chaque résultat de commande est mis en cache dans `_cache` (clé = commande normalisée). Les lectures `/proc/` répétés (ex: `/proc/stat` plusieurs fois) ne sont exécutées qu'une seule fois par run.
+| `FileNotFoundError` | Fichier `/proc/` manquant | Log WARNING, données omises |
+| `PermissionError` | Accès `/proc/sys/` sans root | Log WARNING, champ ignoré |
 
 ---
+
+**Performances attendues :** Cache `(path, mtime)` pour `/proc/`/`/sys/`. Lectures répétées du même fichier = une seule exécution par run.
 
 ### 3.4 `core/event_bus.py`
 
@@ -563,7 +597,7 @@ class Event:
     timestamp_utc: str                 # ISO8601 (ex: "2026-07-03T16:34:00Z")
 
 class EventBus:
-    _subscribers: dict[str, list[Callable[[Event], None]]
+    _subscribers: dict[str, list[Callable[[Event], None]]]
 
     def subscribe(self, event_type: str, handler: Callable[[Event], None]) -> None:
         """Enregistre un handler pour un type d'événement."""
@@ -836,34 +870,86 @@ class CPUContent(BaseModel):
 
 ### 3.9 `core/logger.py`
 
-**Rôle :** Configure le système de logging Python avec sortie structurée JSON, rotation des fichiers, et abonnement automatique à l'EventBus pour journaliser tous les événements.
+**Rôle :** Logger structuré NDJSON avec intégration EventBus. Journalise tous les événements du pipeline dans `/var/log/aicollector/aicollector.log`.
 
-**Entrées :** Configuration (`AICollectorConfig.logging`).
+**Décision d'architecture :** Conforme à la Décision #9 (niveaux séparés, atomicité NDJSON, sanitization, contextualisation).
 
-**Sorties :** Fichiers dans `logs/` + sortie console (optionnelle).
+**Dépendances :** `logging`, `logging.handlers`, `json`, `datetime`, `pathlib`, `core/event_bus.py`.
 
-**Dépendances :** `logging`, `logging.handlers`, `datetime`, `json`, `core/event_bus.py`.
+---
 
 **Configuration par défaut :**
 
-- Niveau : `INFO` (configurable via `config.yaml`)
-- Format : JSON structuré (un objet JSON par ligne — newline-delimited JSON, NDJSON)
-- Rotation : quotidienne (`TimedRotatingFileHandler`)
-- Fichiers conservés : 30 jours (configurable via `retention.logs_days`)
-- Console : optionnelle (`json_output: false` en debug)
+- Rotation : quotidienne (`TimedRotatingFileHandler`, `when='midnight'`, `backupCount=7`)
+- Console : `INFO` (sortie stderr)
+- Fichier : `DEBUG` (capture tout)
 
-**Abonnement EventBus :** Tous les événements émis sur l'EventBus sont logués avec le niveau approprié :
+**Correction du niveau root :**
 
-| Type d'événement | Niveau de log |
-|---|---|
-| `run.started` / `run.finished` | INFO |
-| `collector.started` / `collector.finished` | DEBUG |
-| `collector.failed` | ERROR |
-| `change.detected` (info) | INFO |
-| `change.detected` (warning) | WARNING |
-| `change.detected` (critical) | ERROR |
-| `security.secret_redacted` | WARNING |
-| `run.failed` | FATAL |
+```python
+logger.setLevel(logging.DEBUG)  # Ne filtre rien — délègue aux handlers
+console_handler.setLevel(logging.INFO)
+file_handler.setLevel(logging.DEBUG)
+```
+
+Le logger root est configuré au niveau le plus bas (`DEBUG`) pour ne jamais filtrer. Chaque handler définit son propre seuil de日志级别.
+
+---
+
+**Protection NDJSON (Décision #9)**
+
+Le `_NDJSONFormatter` échappe tous les caractères de contrôle dans les valeurs avant sérialisation :
+
+- `
+` → `
+`, `
+` → `
+`
+- Backslashes, guillemets et caractères de contrôle échappés
+- `default=str` pour les objets non-sérialisables (évite les crashes sur les types exotiques)
+
+Garantie : une ligne = un objet JSON valide, même si un collecteur logue des données binaires ou des sauts de ligne.
+
+---
+
+**Sanitization des credentials (Décision #9)**
+
+Le logger intègre un sanitizer appliqué à toutes les valeurs avant sérialisation :
+
+```python
+CREDENTIAL_PATTERNS = [
+    r"password=\S+",
+    r"token=\S+",
+    r"secret=\S+",
+    r"api_key=\S+",
+    r"Bearer [a-zA-Z0-9_-]+",
+]
+```
+
+Toute valeur correspondant à un pattern → remplacée par `***REDACTED***`.
+
+---
+
+**Contextualisation obligatoire (Décision #9)**
+
+Chaque ligne NDJSON inclut automatiquement :
+
+```json
+{
+  "timestamp": "2026-07-09T21:30:00.000Z",
+  "level": "INFO",
+  "event_type": "collector.finished",
+  "run_id": "a1b2c3d4-...",
+  "module": "pipeline",
+  "collector_name": "cpu",
+  "duration_ms": 142.5,
+  "data_size_bytes": 2048
+}
+```
+
+`run_id` injecté via `LoggerAdapter` wraps sans modifier la signature des appels. `timestamp` en ISO 8601 UTC.
+
+---
 
 **Format de log structuré :**
 
@@ -879,27 +965,45 @@ class CPUContent(BaseModel):
 }
 ```
 
-**Performances attendues :** Logging < 5 ms par entrée, bufferisation en mémoire pour réduire les I/O.
+| Type d'événement | Niveau de log |
+|---|---|
+| `run.started` / `run.finished` | INFO |
+| `collector.started` / `collector.finished` | DEBUG |
+| `collector.failed` | ERROR |
+| `change.detected` (info) | INFO |
+| `change.detected` (warning) | WARNING |
+| `change.detected` (critical) | ERROR |
+| `security.secret_redacted` | WARNING |
+| `run.failed` | FATAL |
 
 ---
 
+**Erreurs possibles :**
+
+| Erreur | Cause | Comportement |
+|---|---|---|
+| `OSError` | Répertoire de log non accessible | Log WARNING sur stderr, continue |
+| `UnicodeEncodeError` | Caractères non-ASCII dans le log | fallback UTF-8 (pas de `ensure_ascii=True`) |
+| `json.JSONEncodeError` | Objet non-sérialisable | `default=str` — pas de crash |
+
 ### 3.10 `core/lockfile.py`
 
-**Rôle :** Gérer le fichier de verrou pour empêcher les runs simultanés.
+**Rôle :** Gestion du fichier de verrou anti-concurrent (`/run/aicollector/aicollector.lock`). Empêche les runs simultanés qui pourraient corrompre `knowledge/`.
 
-**Entrées :** Chemin du lockfile (configurable, défaut `/run/aicollector/aicollector.lock`).
+**Décision d'architecture :** Conforme à la Décision #10 (atomicité POSIX, signal valide, gestion PID 1).
 
-**Sorties :** Booléen indiquant si le verrou a été acquis.
+**Dépendances :** `os`, `signal`, `pathlib`, `datetime`, `core/exceptions.py`.
 
-**Dépendances :** `pathlib`, `os`, `datetime`, `core/exceptions.py`.
+---
 
 **Comportement :**
 
-1. Vérifier que le fichier existe
-2. Si oui, lire le PID contenu et vérifier si le processus est encore vivant (`os.kill(pid, 0)`)
-3. Si le processus est mort, le lockfile est périmé → on l'écrase
-4. Si le processus est vivant → **verrouillage échoué** → quitter proprement avec `LockfileError`
-5. Écrire le PID courant dans le fichier
+1. Tentative d'acquisition atomique via `os.open(path, os.O_CREAT|os.O_EXCL, 0o644)`
+2. Si `O_EXCL` échoue (fichier existe) → lire le PID dormant
+3. Vérifier si le processus est vivant : `os.kill(pid, 0)`
+4. Si le processus est mort → acquisition forcée (écrase le lockfile périmé)
+5. Si le processus est vivant → **verrouillage échoué** → `LockfileError`
+6. Si PID = 1 → vérifier `/proc/1/cmdline` (PID 1 = init/systemd, ne peut pas mourir normalement)
 
 **Structure du lockfile :**
 
@@ -909,38 +1013,91 @@ TIMESTAMP:2026-07-03T16:34:00Z
 RUN_ID:a1b2c3d4-e5f6-7890-abcd-ef1234567890
 ```
 
+---
+
+**Atomicité POSIX (Décision #10)**
+
+```python
+# ❌ Non atomique (race condition)
+if self._lockfile.exists():
+    pid = self._read_pid()
+    if self._process_alive(pid):
+        raise LockfileError(...)
+
+# ✅ Atomique (O_EXCL)
+try:
+    fd = os.open(self._lockfile, os.O_CREAT | os.O_EXCL, 0o644)
+except FileExistsError:
+    # Fichier existe — vérifier si le processus est mort
+    ...
+```
+
+`O_EXCL` garantit que l'appel échoue si le fichier existe déjà — atomicité complète à la primitive système.
+
+> **Note :** Sur NFS, `O_EXCL` peut ne pas être atomique selon la config du serveur NFS. Pour les installations sur NFS shared storage, utiliser une alternative (flock, ou base de données).
+
+---
+
+**Validation PID — Technique POSIX standard (Décision #10)**
+
+```python
+os.kill(pid, 0)              # ✅ Standard POSIX — lève OSError si PID mort/zombie
+os.kill(pid, signal.SIG_DFL) # ❌ Incorrect — SIG_DFL n'est pas un signal réel
+```
+
+---
+
+**Gestion du PID 1 (Décision #10)**
+
+```python
+if pid == 1:
+    cmdline = Path("/proc/1/cmdline").read_text(errors="ignore")
+    if "systemd" not in cmdline and "init" not in cmdline:
+        raise RuntimeError("PID 1 non systemd — lockfile potentiellement invalide")
+```
+
+PID 1 ne meurt jamais brutalement. Mais si `/proc/1/cmdline` ne contient pas `systemd` ou `init`, le lockfile est considéré comme invalide (corrompu) et réécrit.
+
+---
+
 **Erreurs possibles :**
 
 | Erreur | Cause | Comportement |
 |---|---|---|
 | `LockfileError` | Run déjà en cours | Log FATAL, exit code 1 |
-| `PermissionError` | Impossible de créer le fichier | FATAL, exit code 1 |
-
-**Performances attendues :** Vérification < 10 ms. Le fichier est supprimé à la fin du run via `cleanup()`.
+| `PermissionError` | `/run/aicollector/` non accessible en écriture | Log FATAL, exit code 1 |
+| `OSError` | PID illisible (fichier corrompu) | Log WARNING, acquisition forcée |
 
 ---
 
+**Performances attendues :** O(1) — une vérification de fichier + un appel `os.kill(pid, 0)`.
 ### 3.11 `core/hashing.py`
 
-**Rôle :** Fonctions utilitaires pour le calcul de hash SHA256 sur des données JSON.
+**Rôle :** Fonctions utilitaires pour le calcul de hash SHA256 sur des données JSON et fichiers.
 
-**Entrées :** Dictionnaires Python ou chaînes JSON.
+**Entrées :** Dictionnaires Python, chaînes JSON, ou fichiers sur disque.
 
-**Sorties :** Chaîne hexadécimale SHA256 (64 caractères).
+**Sorties :** Chaîne SHA256 préfixée `sha256:` (standard obligatoire du projet — Décision #6).
 
-**Dépendances :** `hashlib`, `json`.
+**Dépendances :** `hashlib`, `json`, `datetime` (pour le fallback encoder).
 
 **Fonctions :**
 
 ```python
-def compute_json_hash(data: dict, canonical: bool = True) -> str:
+def compute_json_hash(data: dict[str, Any], *, canonical: bool = True) -> str:
     """
     Calcule le SHA256 d'un dictionnaire.
     Si canonical=True, le JSON est sérialisé avec sorted_keys=True
     et indent=None pour garantir la reproductibilité.
+    Un encoder `default` gère les types non-JSON-natifs (datetime → isoformat,
+    Path → str, set → str, Enum → str) pour éviter les TypeError silencieux.
     """
-    canonical_json = json.dumps(data, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical_json.encode()).hexdigest()
+    if canonical:
+        canonical_json = json.dumps(data, sort_keys=True, separators=(",", ":"))
+    else:
+        canonical_json = json.dumps(data, sort_keys=False)
+    digest = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
 
 
 def compute_file_hash(path: Path) -> str:
@@ -949,9 +1106,16 @@ def compute_file_hash(path: Path) -> str:
 
 **Canonicalisation :** Les espaces, l'ordre des clés et le format des nombres floats sont normalisés avant le calcul pour garantir que deux représentationslogiquement équivalentes produisent le même hash.
 
+**Standard du préfixe `sha256:` (Décision #6) :** Tous les hash générés par le projet sont préfixés par `sha256:`. Cela permet d'identifier rapidement l'algorithme dans les manifestes et les logs, et prépare une future extensibilité multi-algorithme (sha512, blake2).
+
+**Fallback encoder (Décision #6) :** Pour éviter les `TypeError` silencieux lors du hashing de données contenant des types non-JSON-natifs, `json.dumps` utilise un paramètre `default` qui convertit :
+- `datetime` → `value.isoformat()` (ISO 8601, déterministe)
+- `Path` → `str(value)` (dernier recours)
+- Types résiduels → `str(value)` (permet au hash de calculer, avec warning si non déterministe)
+
 **Performances attendues :** Hash < 5 ms pour un JSON de 1 Mo.
 
----
+------
 
 ### 3.12 `core/diff_engine.py`
 
@@ -1046,40 +1210,57 @@ FORBIDDEN_PATHS: set[str] = {
 
 ### 3.14 `core/knowledge_store.py`
 
-**Rôle :** Gère la persistance et la lecture de `knowledge/`, la rotation de `history/`, et la purge FIFO de `changes/`.
+**Rôle :** Gère la persistance et la lecture de `knowledge/`, la rotation physique FIFO de `history/`, et la purge FIFO de `changes/`.
 
 **Entrées :** JSON normalisé (dict), configuration de rétention.
 
-**Sorties :** Fichiers écrits sur disque, mise à jour des manifestes.
+**Sorties :** Fichiers écrits sur disque de manière atomique, mise à jour atomique des manifestes.
 
-**Dépendances :** `pathlib`, `json`, `core/hashing.py`, `core/exceptions.py`.
+**Dépendances :** `pathlib`, `json`, `os`, `tempfile`, `core/hashing.py`, `core/exceptions.py`.
 
 **Méthodes publiques :**
 
 | Méthode | Rôle |
 |---|---|
-| `write_knowledge(collector_name, data)` | Écrit `knowledge/<collector>.json` et met à jour `knowledge/manifest.json` |
+| `write_knowledge(collector_name, data)` | Écrit `knowledge/<collector>.json` (atomiquement) et met à jour `knowledge/manifest.json` (atomiquement) |
 | `read_knowledge(collector_name)` | Lit le dernier JSON connu d'un collecteur |
-| `rotate_history(collector_name, data)` | Copie le JSON actuel dans `history/<collector>/<N>.json` (N incrémenté), purge FIFO |
+| `rotate_history(collector_name, data)` | Copie le JSON actuel via index-shift FIFO, purge le plus ancien si limite atteinte |
 | `read_history(collector_name, version)` | Lit une version historique |
 | `list_history_versions(collector_name)` | Renvoie la liste des versions disponibles |
-| `write_change(change_data)` | Écrit `changes/<timestamp>.json` et met à jour `changes/manifest.json` |
+| `write_change(change_data)` | Écrit `changes/<timestamp>.json` (atomiquement) et met à jour `changes/manifest.json` (atomiquement) |
 | `prune_changes(keep: int)` | Purge FIFO — ne conserve que les `keep` derniers changements |
 | `read_changes_manifest()` | Lit `changes/manifest.json` |
 | `read_knowledge_manifest()` | Lit `knowledge/manifest.json` |
 
-**Rotation de l'historique :**
+**Écriture atomique POSIX (Décision #7) :** Toutes les écritures de fichiers JSON utilisent le pattern atomic write :
+1. Écriture dans un fichier temporaire via `tempfile.NamedTemporaryFile` (`mode='w'`, `encoding='utf-8'`, `delete=False`)
+2. Fermeture du fichier temporaire
+3. Renommage atomique via `os.replace(src, dst)`
+
+Ce pattern garantit qu'en cas de crash, de signal d'interruption, ou de coupure disque, le fichier de destination est soit l'ancienne version intacte, soit la nouvelle version complète. Aucun JSON partiellement écrit ne peut exister sur disque.
+
+**Rotation physique FIFO avec index-shift (Décision #7) :**
 
 ```
 history/<collector>/
-  ├── 0001.json   ← plus ancien (sera supprimé en premier)
+  ├── 0001.json   ← plus ancien (sera supprimé en premier par shift)
   ├── 0002.json
   ├── ...
   ├── 0049.json
   └── 0050.json  ← plus récent
 ```
 
-Rotation = copie du fichier courant dans le prochain numéro + purge si `len(files) > retention.history_versions`.
+Quand la limite `retention.history_versions` est atteinte :
+1. Le fichier `0001` est supprimé (`os.remove`)
+2. Tous les fichiers restants sont renommés : `0002→0001`, `0003→0002`, …, `max→max-1`
+3. Le nouveau fichier est écrit en dernier slot (max)
+
+L'index ne dérive jamais. Les noms de fichiers restent bornés (pas de `9999+`).
+
+**Maintenance atomique des manifestes (Décision #7) :**
+- `write_knowledge()` met à jour `knowledge/manifest.json` atomiquement après chaque écriture (incluant hash SHA256, timestamp, métadonnées)
+- `write_change()` met à jour `changes/manifest.json` atomiquement après chaque détection de changement
+- Les manifestes constituent l'index synthétique permettant à un agent IA de naviguer sans scanner le disque
 
 **Erreurs possibles :**
 
@@ -1122,33 +1303,37 @@ Rotation = copie du fichier courant dans le prochain numéro + purge si `len(fil
 
 **Rôle :** Hiérarchie complète des exceptions custom du projet.
 
-**Dépendances :** `abc` (pour les classes de base).
+**Dépendances :** `abc` (pour les classes de base), `datetime` (pour `cause`).
+
+**Propriété publique `is_blocking` :** Toutes les exceptions de la hiérarchie exposent une propriété publique `is_blocking` (anciennement `_is_blocking`, renommé pour signaler qu'il fait partie de l'API publique). Cette propriété est interrogée par le pipeline (`pipeline.py`) pour décider si une erreur doit interrompre le run. La valeur par défaut est `False` (non bloquant) ; seule une minorité d'exceptions critiques la mettent à `True`.
+
+**Chaînage `cause` :** Les exceptions propagées (ex: `CollectorError` contenant l'exception d'origine d'une commande `subprocess`) utilisent le pattern `cause` : `raise CollectorError("...") from e`. Le champ `cause` est exposé par la propriété `exception.__cause__` et loggué en DEBUG pour faciliter le diagnostic.
 
 ```
-AICollectorError (base)
-├── CollectorError
-│   ├── CollectorNotFoundError
-│   ├── CollectorTimeoutError
-│   └── CollectorPermissionError
-├── SystemAdapterError
-│   ├── ForbiddenCommandError        ← BLOQUANT
-│   ├── CommandExecutionError
-│   └── ProcFileReadError
-├── ConfigError
-│   ├── ConfigFileNotFoundError       ← BLOQUANT
-│   └── ConfigValidationError        ← BLOQUANT
-├── PipelineError
-│   ├── PhaseError
-│   └── RunInterruptedError
-├── LockfileError                     ← BLOQUANT
-├── SchemaValidationError
-├── KnowledgeStoreError
-│   ├── KnowledgeWriteError
-│   └── HistoryReadError
-└── EventBusError
+AICollectorError (base, is_blocking=False)
+├── CollectorError (is_blocking=False)
+│   ├── CollectorNotFoundError (is_blocking=False)
+│   ├── CollectorTimeoutError (is_blocking=False)
+│   └── CollectorPermissionError (is_blocking=False)
+├── SystemAdapterError (is_blocking=False)
+│   ├── ForbiddenCommandError (is_blocking=True)  ← BLOQUANT
+│   ├── CommandExecutionError (is_blocking=False)  ← NON BLOQUANT (Décision #5)
+│   └── ProcFileReadError (is_blocking=False)
+├── ConfigError (is_blocking=True)  ← BLOQUANT
+│   ├── ConfigFileNotFoundError (is_blocking=True)
+│   └── ConfigValidationError (is_blocking=True)
+├── PipelineError (is_blocking=True)  ← BLOQUANT
+│   ├── PhaseError (is_blocking=True)
+│   └── RunInterruptedError (is_blocking=True)
+├── LockfileError (is_blocking=True)  ← BLOQUANT
+├── SchemaValidationError (is_blocking=False)
+├── KnowledgeStoreError (is_blocking=False)
+│   ├── KnowledgeWriteError (is_blocking=False)
+│   └── HistoryReadError (is_blocking=False)
+└── EventBusError (is_blocking=False)
 ```
 
-**Convention :** Toutes les exceptions customisent `__str__` pour afficher un message structuré `{ClassName}: {détail}`. Les exceptions critiques incluent un champ `exit_code`.
+**Convention :** Toutes les exceptions customisent `__str__` pour afficher un message structuré `{ClassName}: {détail}`. Les exceptions critiques incluent un champ `exit_code`. Les exceptions propagées chainent la cause via `raise X from e`.
 
 **Performances attendues :** Négligeable.
 
@@ -1193,7 +1378,7 @@ def register_collector(name: str):
 | `systemd_services` | `systemctl list-units --all --no-pager` | Non | 30s |
 | `firewall` | `ufw status verbose`, `iptables -L -n` | **Oui** | 20s |
 | `auditd` | `auditctl -s`, `/var/log/audit/audit.log` | **Oui** | 30s |
-| `apt` | `dpkg -l`, `apt list --upgradable` | Non | 40s |
+| `apt` | `dpkg-query --show --showformat='$i\t\$p\t\$v\t\$V\t\$s\t\$c\n'`, `apt list --upgradable 2>/dev/null` | Non | 40s |
 | `users` | `getent passwd`, `getent group` | Non | 15s |
 | `cron` | `crontab -l` (chaque utilisateur) | Non | 30s |
 | `timers` | `systemctl list-timers --all` | Non | 20s |
@@ -1210,6 +1395,124 @@ def register_collector(name: str):
 6. Implémenter `classify_change()` si le comportement par défaut ne convient pas
 
 Aucun composant du pipeline ne doit être modifié. Seuls les points d'extension prévus (`schemas.py`, exporters, etc.) peuvent être étendus.
+
+---
+
+### 3.18 `collectors/apt.py`
+
+**Rôle :** Collecter la liste exhaustive des paquets Debian/Ubuntu installés via `dpkg-query`, ainsi que les mises à jour disponibles via `apt list --upgradable`.
+
+**Commande(s) source :**
+- `dpkg-query --show --showformat='${db:Status-Abbrev}|${Package}|${Version}|${Installed-Size}|${binary:Field-Description}' 2>/dev/null`
+- `apt list --upgradable 2>/dev/null` (optionnel — avertissement si dpkg-query indisponible)
+
+**Détails de l'implémentation :**
+
+**Choix d'implémentation :** Plutôt que d'analyser `dpkg -l` (dont la largeur des colonnes est affectée par la variable d'environnement `COLUMNS`, ce qui tronque les noms de paquets longs), le collecteur APT exploite **`dpkg-query`** avec l'option `--show` combinée à `--showformat`. Cette approche offre :
+
+1. **Robuste et prévisible :** Délimitation stricte des champs par un séparateur de type tabulation (`	`), aucun risque de décalage de colonnes.
+2. **Filtrage à la source :** Ne cible que les paquets avec `db:Status-Abbrev = ii` (état `installed`), excluant les résidus de configuration (`rc`) ou les paquets purgés.
+3. **Uniqueness garantie :** Chaque ligne correspond à un et un seul enregistrement de paquet — aucune ambiguïté.
+4. **Performant :** Lecture directe de la base dpkg en une seule commande `O(n)` — aucun parsing intermédiaire.
+
+**Format du `--showformat` :**
+
+```
+db:Status-Abbrev|Package|Version|Installed-Size|binary:Field-Description
+```
+
+- Champs séparés par `|` (pipe) — caractère rarissime dans les noms de paquets
+- `db:Status-Abbrev` (2 caractères) : état du paquet dans la base dpkg
+  - `ii` = installé (Installed)
+  - `iU` = décompressé mais non-configuré
+  - `rc` =残留 de configuration (Removed, Config-files remain)
+  - `pn` = packet not found
+- `Package` : nom du paquet (peut contenir des `-` et des `_`)
+- `Version` : version EPoch:Debian-Release du paquet installé
+- `Installed-Size` : taille 安装ée en Ko (entier)
+- `binary:Field-Description` : champ description binaire (première ligne uniquement = synopsis court)
+
+**Algorithme de collecte :**
+
+```
+1. Exécuter dpkg-query avec --showformat pipe-delimited
+2. Pour chaque ligne non-vide :
+   a. Split sur '|'
+   b. Vérifier que db:Status-Abbrev == 'ii' (sinon → skip)
+   c. Extraire les 5 champs dans l'ordre
+   d. Parser Installed-Size en entier
+   e. Append au tableau packages
+3. Statistiques : total_packages = len(packages)
+4. Si apt list --upgradable disponible :
+   a. Parser la sortie apt list (format: "paquet/version [upgradable from: x to: y]")
+   b. Enrichir le champ status de chaque APTPackage correspondant
+   c. Compter upgradable_packages
+```
+
+**Gestion des erreurs :**
+- `dpkg-query: pas de候选人` → retourne `packages: []` avec `confidence_score = 0.0` et `inconsistencies_detected` = "dpkg database empty or dpkg-query not available"
+- `apt list` échoue (non-root, ou apt mal configuré) → champ `upgradable_packages_list: []` avec avertissement dans `inconsistencies_detected`
+
+**Paquets exclus par conception :**
+- Tous les paquets dont `db:Status-Abbrev ≠ ii` (résidus de config, supprimés, etc.)
+- Les_virtual_packages_ listedés par `dpkg` mais non traçables par `dpkg-query --show`
+
+**Performances attendues :**
+- Exécution < 5 s sur un serveur standard (600-2000 paquets)
+- Mémoire : proportionnelle au nombre de paquets (~200 octets/par paquet → ~400 Ko pour 2000 paquets)
+- Validation Pydantic < 10 ms
+
+**Schéma JSON (`APTCollectorSchema`, schema_version 1.1) :**
+
+```json
+{
+  "schema_version": "1.1",
+  "collector_version": "1.0.0",
+  "server_uuid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "timestamp_utc": "2026-07-14T11:00:00Z",
+  "source": "apt",
+  "hash": "sha256:...",
+  "content": {
+    "distribution": "Ubuntu 26.04 LTS",
+    "total_packages": 1247,
+    "installed_packages": 1198,
+    "upgradable_packages": 3,
+    "packages": [
+      {
+        "name": "openssl",
+        "architecture": "amd64",
+        "version": "3.0.13-0ubuntu3",
+        "installed_version": "3.0.13-0ubuntu3",
+        "size_bytes": 2097152,
+        "description": "Secure Sockets and Transport Layer Security",
+        "status": "installed"
+      }
+    ],
+    "upgradable_packages_list": [
+      {
+        "name": "curl",
+        "architecture": "amd64",
+        "version": "8.12.1-2ubuntu3",
+        "installed_version": "8.12.1-2ubuntu1",
+        "size_bytes": 734003,
+        "description": "command line tool for transferring data with URL syntax",
+        "status": "upgradable"
+      }
+    ]
+  },
+  "confidence_score": 0.99,
+  "dependencies": [],
+  "inconsistencies_detected": [],
+  "capabilities": {
+    "supported_platforms": ["linux"],
+    "min_confidence": 0.95,
+    "known_inconsistencies": [
+      "apt list requires root or sudo for full upgrade list",
+      "virtual packages not listed by dpkg-query --show"
+    ]
+  }
+}
+```
 
 ---
 
@@ -1250,7 +1553,8 @@ Chaque fichier JSON produit par un collecteur respecte la structure suivante :
 | Version de schéma | Collecteur(s) | Date d'introduction | Changements |
 |---|---|---|---|
 | 1.0 | Tous | V1.0 | Schéma initial |
-| 1.1 | docker | V1.1 (future) | Ajout champ `networks` dans le content |
+| 1.1 | apt | V1.2 | Schéma initial du collecteur APT (programmes installés + mises à jour disponibles) |
+| 1.2 | docker | V1.1 (future) | Ajout champ `networks` dans le content |
 
 ### 4.3 Exemples JSON complets
 
@@ -1525,6 +1829,100 @@ Chaque fichier JSON produit par un collecteur respecte la structure suivante :
     "known_inconsistencies": [
       "requires docker daemon running and user in docker group or root",
       "container exit codes are snapshot at collect time"
+    ]
+  }
+}
+```
+
+---
+
+
+
+---
+
+#### Exemple 4 : `knowledge/apt.json`
+
+```json
+{
+  "schema_version": "1.1",
+  "collector_version": "1.0.0",
+  "server_uuid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "timestamp_utc": "2026-07-14T11:00:00Z",
+  "source": "apt",
+  "hash": "sha256:9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a",
+  "content": {
+    "distribution": "Ubuntu 26.04 LTS",
+    "total_packages": 1247,
+    "installed_packages": 1198,
+    "upgradable_packages": 3,
+    "packages": [
+      {
+        "name": "openssl",
+        "architecture": "amd64",
+        "version": "3.0.13-0ubuntu3",
+        "installed_version": "3.0.13-0ubuntu3",
+        "size_bytes": 2097152,
+        "description": "Secure Sockets and Transport Layer Security",
+        "status": "installed"
+      },
+      {
+        "name": "curl",
+        "architecture": "amd64",
+        "version": "8.12.1-2ubuntu3",
+        "installed_version": "8.12.1-2ubuntu1",
+        "size_bytes": 734003,
+        "description": "command line tool for transferring data with URL syntax",
+        "status": "upgradable"
+      },
+      {
+        "name": "python3",
+        "architecture": "amd64",
+        "version": "3.13.1-1ubuntu3",
+        "installed_version": "3.13.1-1ubuntu3",
+        "size_bytes": 45875200,
+        "description": "interpreter of the Python programming language",
+        "status": "installed"
+      }
+    ],
+    "upgradable_packages_list": [
+      {
+        "name": "curl",
+        "architecture": "amd64",
+        "version": "8.12.1-2ubuntu3",
+        "installed_version": "8.12.1-2ubuntu1",
+        "size_bytes": 734003,
+        "description": "command line tool for transferring data with URL syntax",
+        "status": "upgradable"
+      },
+      {
+        "name": "tzdata",
+        "architecture": "all",
+        "version": "2026a-0ubuntu3",
+        "installed_version": "2025b-0ubuntu2",
+        "size_bytes": 1536000,
+        "description": "time zone and daylight-saving time data",
+        "status": "upgradable"
+      },
+      {
+        "name": "libssl3t64",
+        "architecture": "amd64",
+        "version": "3.0.13-0ubuntu3",
+        "installed_version": "3.0.13-0ubuntu2",
+        "size_bytes": 1945600,
+        "description": "Secure Sockets and Transport Layer Security",
+        "status": "upgradable"
+      }
+    ]
+  },
+  "confidence_score": 0.99,
+  "dependencies": [],
+  "inconsistencies_detected": [],
+  "capabilities": {
+    "supported_platforms": ["linux"],
+    "min_confidence": 0.95,
+    "known_inconsistencies": [
+      "apt list --upgradable requires root or sudo for complete upgrade list",
+      "virtual packages are not listed by dpkg-query --show"
     ]
   }
 }
@@ -2010,54 +2408,56 @@ Ces limites sont configurables via `config.yaml`.
 
 | Catégorie | Définition | Comportement |
 |---|---|---|
-| **Bloquante** | Empêche le run de se terminer correctement | Log FATAL, exit code != 0, pas d'écriture dans `knowledge/` |
-| **Non bloquante** | Un collecteur échoue mais les autres continuent | Log ERROR pour le collecteur, `CollectorError` dans le résultat, run continue |
+| **Bloquante** | Empêche le run de se terminer correctement | Log FATAL, exit code != 0, pas d'écriture dans `knowledge/` — correspond à `is_blocking=True` |
+| **Non bloquante** | Un collecteur échoue mais les autres continuent | Log ERROR pour le collecteur, `CollectorError` dans le résultat, run continue — correspond à `is_blocking=False` |
 | **Warning** | Anomalie détectée mais données disponibles | Log WARNING, données incluent `inconsistencies_detected` |
 | **Info** | Événement normal notable | Log INFO |
 
 ### 9.2 Hiérarchie des erreurs
 
 ```
-AICollectorError (base, exit_code=1)
-├── CollectorError (exit_code=2)
-│   ├── CollectorNotFoundError (exit_code=2)
-│   ├── CollectorTimeoutError (exit_code=3)
-│   └── CollectorPermissionError (exit_code=3)
-├── SystemAdapterError (exit_code=4)
-│   ├── ForbiddenCommandError (exit_code=4) ← BLOQUANT
-│   ├── CommandExecutionError (exit_code=4)
-│   └── ProcFileReadError (exit_code=5)
-├── ConfigError (exit_code=10)
-│   ├── ConfigFileNotFoundError (exit_code=10) ← BLOQUANT
-│   └── ConfigValidationError (exit_code=10) ← BLOQUANT
-├── PipelineError (exit_code=20)
-│   ├── PhaseError (exit_code=20)
-│   └── RunInterruptedError (exit_code=20)
-├── LockfileError (exit_code=30) ← BLOQUANT
-├── SchemaValidationError (exit_code=40)
-├── KnowledgeStoreError (exit_code=50)
-│   ├── KnowledgeWriteError (exit_code=51)
-│   └── HistoryReadError (exit_code=52)
-└── EventBusError (exit_code=60)
+AICollectorError (base, exit_code=1, is_blocking=False)
+├── CollectorError (exit_code=2, is_blocking=False)
+│   ├── CollectorNotFoundError (exit_code=2, is_blocking=False)
+│   ├── CollectorTimeoutError (exit_code=3, is_blocking=False)
+│   └── CollectorPermissionError (exit_code=3, is_blocking=False)
+├── SystemAdapterError (exit_code=4, is_blocking=False)
+│   ├── ForbiddenCommandError (exit_code=4, is_blocking=True)  ← BLOQUANT
+│   ├── CommandExecutionError (exit_code=4, is_blocking=False)  ← NON BLOQUANT (Décision #5)
+│   └── ProcFileReadError (exit_code=5, is_blocking=False)
+├── ConfigError (exit_code=10, is_blocking=True)  ← BLOQUANT
+│   ├── ConfigFileNotFoundError (exit_code=10, is_blocking=True)
+│   └── ConfigValidationError (exit_code=10, is_blocking=True)
+├── PipelineError (exit_code=20, is_blocking=True)  ← BLOQUANT
+│   ├── PhaseError (exit_code=20, is_blocking=True)
+│   └── RunInterruptedError (exit_code=20, is_blocking=True)
+├── LockfileError (exit_code=30, is_blocking=True)  ← BLOQUANT
+├── SchemaValidationError (exit_code=40, is_blocking=False)
+├── KnowledgeStoreError (exit_code=50, is_blocking=False)
+│   ├── KnowledgeWriteError (exit_code=51, is_blocking=False)
+│   └── HistoryReadError (exit_code=52, is_blocking=False)
+└── EventBusError (exit_code=60, is_blocking=False)
 ```
 
 ### 9.3 Table des codes d'erreur
 
-| Code | Classe | Type | Run interrompu | Description |
-|---|---|---|---|---|
-| 1 | `AICollectorError` | Base | Oui | Erreur générique non classifiée |
-| 2 | `CollectorError` | Non bloquant | Non | Erreur collecteur générique |
-| 3 | `CollectorTimeoutError` | Non bloquant | Non | Timeout collecteur dépassé |
-| 4 | `ForbiddenCommandError` | **Bloquant** | Oui | Commande hors whitelist |
-| 5 | `ProcFileReadError` | Non bloquant | Non | Fichier `/proc/` illisible |
-| 10 | `ConfigFileNotFoundError` | **Bloquant** | Oui | Fichier config absent |
-| 11 | `ConfigValidationError` | **Bloquant** | Oui | Config YAML invalide |
-| 20 | `PipelineError` | **Bloquant** | Oui | Erreur dans le pipeline |
-| 30 | `LockfileError` | **Bloquant** | Oui | Run déjà en cours |
-| 40 | `SchemaValidationError` | Non bloquant | Non | JSON ne valide pas le schéma |
-| 50 | `KnowledgeWriteError` | Non bloquant | Non | Échec écriture knowledge/ |
-| 51 | `HistoryReadError` | Non bloquant | Non | Historique illisible |
-| 60 | `EventBusError` | Non bloquant | Non | Erreur bus d'événements |
+| Code | Classe | Type | `is_blocking` | Run interrompu | Description |
+|---|---|---|---|---|---|
+| 1 | `AICollectorError` | Base | `False` | Non | Erreur générique non classifiée |
+| 2 | `CollectorError` | Non bloquant | `False` | Non | Erreur collecteur générique |
+| 3 | `CollectorTimeoutError` | Non bloquant | `False` | Non | Timeout collecteur dépassé |
+| 4 | `ForbiddenCommandError` | **Bloquant** | `True` | Oui | Commande hors whitelist |
+| 5 | `ProcFileReadError` | Non bloquant | `False` | Non | Fichier `/proc/` illisible |
+| 10 | `ConfigFileNotFoundError` | **Bloquant** | `True` | Oui | Fichier config absent |
+| 11 | `ConfigValidationError` | **Bloquant** | `True` | Oui | Config YAML invalide |
+| 20 | `PipelineError` | **Bloquant** | `True` | Oui | Erreur dans le pipeline |
+| 30 | `LockfileError` | **Bloquant** | `True` | Oui | Run déjà en cours |
+| 40 | `SchemaValidationError` | Non bloquant | `False` | Non | JSON ne valide pas le schéma |
+| 50 | `KnowledgeWriteError` | Non bloquant | `False` | Non | Échec écriture knowledge/ |
+| 51 | `HistoryReadError` | Non bloquant | `False` | Non | Historique illisible |
+| 60 | `EventBusError` | Non bloquant | `False` | Non | Erreur bus d'événements |
+
+> **Note sur `is_blocking` (Décision #5) :** Cette colonne explicite le champ public `is_blocking` introduit dans toutes les exceptions. Le pipeline interroge `exc.is_blocking` pour décider si le run doit être interrompu. Les exceptions propagées chainent leur cause via `raise X from e`.
 
 ### 9.4 Comportements attendus par erreur
 
@@ -2067,6 +2467,7 @@ AICollectorError (base, exit_code=1)
 | `ForbiddenCommandError` | Log FATAL, **run interrompu immédiatement**, pas d'écriture, exit code 4 |
 | `ConfigValidationError` | Log FATAL avec détails du champ invalide, exit code 10 |
 | `LockfileError` | Log FATAL, exit code 30, suggère de vérifier les processus en cours |
+| `CommandExecutionError` (Décision #5) | Erreur d'exécution d'une commande collecteur individuelle — **`is_blocking=False`**. L'erreur est capturée dans `CollectorResult.errors`, le pipeline continue avec une collecte partielle. |
 | `SchemaValidationError` | Log WARNING, le JSON brut est écrit avec `confidence_score=0.0`, l'agent IA sait que les données ne sont pas validées |
 | `KnowledgeWriteError` | Log ERROR, retry une fois après 1 seconde ; si échec, warning non bloquant |
 | `PermissionError` (sans root) | Log WARNING, collecteur marqué `requires_root` → désactivé pour ce run |
@@ -2105,7 +2506,30 @@ AICollectorError (base, exit_code=1)
 3. Hériter de `BaseCollector`
 4. Ajouter le décorateur `@register_collector("mon_collecteur")`
 5. Implémenter `collect(self, system: SystemAdapter) -> CollectorResult`
-6. Créer le schéma Pydantic correspondant dans `core/schemas.py` en tant que point d'extension prévu, via le décorateur `@register_collector_schema` (section séparée — le registre dynamique met à jour la validation automatiquement, aucun ajout manuel dans `CollectorSchemaUnion` n'est nécessaire)
+6. Créer le schéma Pydantic correspondant dans `core/schemas.py` en tant que point d'extension prévu, via le décorateur `@register_collector_schema` (section séparée — le registre dynamique met à jour la validation automatiquement, aucun ajout manuel dans `CollectorSchemaUnion` n'est nécessaire).
+   Pour référence, voici le schéma du collecteur `apt` (collecteur de paquets APT) :
+   ```python
+   class APTPackage(BaseModel):
+       name: str
+       architecture: str
+       version: str
+       installed_version: str
+       size_bytes: int
+       description: str
+       status: Literal["installed", "upgradable", "not-installed"]
+
+class APTContent(BaseModel):
+       distribution: str
+             total_packages: int
+       installed_packages: int
+       upgradable_packages: int
+       packages: list[APTPackage]
+       upgradable_packages_list: list[APTPackage]
+
+@register_collector_schema("apt")
+   class APTCollectorSchema(CollectorSchema):
+       content: APTContent
+   ```
 7. Tester avec `python collector.py --collector mon_collecteur --dry-run`
 
 > **Données produites :** `/var/lib/aicollector/knowledge/<nom>.json` (dernier snapshot)
@@ -2469,7 +2893,7 @@ tests/
 ### V0.2 — Collecteurs noyau et détection de changement ⏱ Objectif : 2 semaines
 
 **Fonctionnalités :**
-- [ ] 8 collecteurs noyau : network, docker, systemd_services, firewall, auditd, apt, users, cron
+- [x] 8 collecteurs noyau : network, docker, systemd_services, firewall, auditd, apt, users, cron
 - [ ] `diff_engine.py` fonctionnel avec comparison récursive
 - [ ] Écriture de `changes/<timestamp>.json`
 - [ ] Mise à jour de `changes/manifest.json`
@@ -2853,6 +3277,42 @@ L'absence de `kubernetes` client ou `kubectl` n'est pas une erreur — le collec
 ---
 
 
+
+---
+
+## 13.4 Décisions techniques validées (2026-07-10)
+
+Les analyses critiques des modules suivants ont été réalisées :
+
+### 13.4.1 `registry.py` — Faillesys.path et pollution d'import
+
+| Problème | Gravité | Correctif |
+|---|---|---|
+| Insertion de `sys.path` en index 0 (shadowing) | 🔴 Haute | Utiliser `importlib.util.spec_from_file_location` |
+| Pollution du `sys.path` global | 🟡 Moyenne | Isoler l'import dans un contexte temporaire |
+| `_discovered` comme attribut de classe | 🟡 Moyenne | Déplacer vers `_instance` singleton |
+| Importations silencieusement ignorées | 🔴 Haute | Collecter et journaliser les erreurs |
+
+### 13.4.2 `sanitizer.py` — Destruction du contexte et code mort
+
+| Problème | Gravité | Correctif |
+|---|---|---|
+| Remplacement global de la chaîne entière | 🔴 Haute | Redaction partielle via `re.sub` sur match seul |
+| Bug de réentrance (`re.sub` dans `substitution`) | 🔴 Bloquante | Créer `_compile_pattern` à la volée |
+| Mixin `SanitizerMixin` non référencé (code mort) | 🟡 Moyenne | Supprimer ou implémenter le mixin |
+| `SanitizerMixin.__init__` absent | 🟡 Moyenne | Ajouter ou Documenter le contrat |
+
+### 13.4.3 `schemas.py` — NameError et incohérence de validation
+
+| Problème | Gravité | Correctif |
+|---|---|---|
+| `Literal` non importé (`NameError`) | 🔴 Bloquante | Ajouter `Literal` à l'import `typing` |
+| Schéma `RAMCollectorSchema` absent | 🔴 Bloquante | Créer et enregistrer le schéma |
+| `_COLLECTOR_SCHEMA_REGISTRY` non exporté | 🟡 Moyenne | Exposer via `__all__` ou propriété |
+| Type hints incohérents (`typed_dict` vs `BaseModel`) | 🟡 Moyenne | Uniformiser les types dans les schémas |
+
+---
+
 ## Annexe — Glossaire
 
 | Terme | Définition |
@@ -2870,4 +3330,7 @@ L'absence de `kubernetes` client ou `kubectl` n'est pas une erreur — le collec
 | **Canonical JSON** | JSON sérialisé avec clés triées et séparateurs stricts pour reproductibilité du hash |
 | **FIFO** | First In, First Out — politique de rétention qui purge les entrées les plus anciennes |
 | **NDJSON** | Newline-Delimited JSON — un objet JSON par ligne, utilisé pour les logs |
-| **SHA256 Canonical Hash** | Hash SHA256 calculé sur du JSON canonique (clé triées, séparateurs normalisés) |
+| **SHA256 Canonical Hash** | Hash SHA256 calculé sur du JSON canonique (clés triées, séparateurs normalisés) et préfixé `sha256:` (standard obligatoire du projet — Décision #6) |
+
+| **dpkg-query** | Outil en ligne de commande pour interroger la base de données des paquets Debian/Ubuntu. Utilisé par le collecteur APT pour obtenir une liste délimitée et dénuée d'ambiguïté de tous les paquets installés. |
+| **APT** | Advanced Packaging Tool — système de gestion de paquets d'Ubuntu/Debian. Le collecteur `apt` interroge à la fois `dpkg-query` (liste des installés) et `apt list` (mises à jour disponibles). |
