@@ -566,4 +566,195 @@ for arg in args:
 - Collecteurs affectés : `dpkg-query -W --showformat='${Status}\n'` (contient `--show` → `sh` substring) et autres utilisant des arguments avec des sous-chaînes commonnes.
 - Faux positifs éliminés : `--show`, `dash`, `bash` (dans un chemin), `push`, etc.
 
-*Derniere mise a jour : 2026-07-15*
+
+
+---
+
+## Décision #23
+
+| Champ | Valeur |
+|---|---|
+| **Date** | 2026-07-16 |
+| **Sujet** | Format du timestamp dans les manifests |
+| **Statut** | **ACTIVE** |
+
+Le schema JSON de `manifest.json` et de chaque collecteur exige un timestamp au format strict :
+
+```
+^d{4}-d{2}-d{2}Td{2}:d{2}:d{2}Z$
+```
+
+Cela signifie **sans microsecondes** (pas de `.fff` apres les secondes). Si `datetime.now().isoformat()` produit un timestamp avec microsecondes, il faut le tronquer :
+
+```python
+# Incorrect (inclut les microsecondes)
+timestamp_utc = datetime.now().isoformat()
+
+# Correct (tronque a la seconde)
+timestamp_utc = datetime.now().replace(microsecond=0).isoformat() + "Z"
+```
+
+Ce probleme affectait `_write_knowledge_json` dans `core/pipeline.py`.
+
+**Justification :** Le format ISO 8601 avec `Z` suffixe est la norme du projet. Les microsecondes ne sont pas authorisees par les schemas Pydantic et causent une erreur de validation `ValidationError`.
+
+**Contexte technique :** La fonction `compute_json_hash` et la serialisation JSON doivent utiliser un timestamp canonique sans microsecondes pour garantir la reproductibilite du hash.
+
+---
+
+## Decision #24
+
+| Champ | Valeur |
+|---|---|
+| **Date** | 2026-07-16 |
+| **Sujet** | Prefixe `sha256:` dans le calcul du hash de document |
+| **Statut** | **ACTIVE** |
+
+La fonction `compute_json_hash` (dans `core/hashing.py` ou `core/system_adapter.py`) **ajoute deja d'elle-meme** le prefixe `sha256:` au hash hexadecimal. En faire l'ajout manuellement dans `_phase_normalize` cree un **double prefixe** `sha256:sha256:` invalide.
+
+```python
+# Incorrect (double prefixe)
+doc_hash = f"sha256:{compute_json_hash(normalized_doc)}"
+
+# Correct (compute_json_hash inclut deja le prefixe)
+doc_hash = compute_json_hash(normalized_doc)
+```
+
+Ce probleme affectait `_phase_normalize` dans `core/pipeline.py`.
+
+**Justification :** Le schema exige `^sha256:[0-9a-f]{64}$`. Si `compute_json_hash` retourne deja `"sha256:048e6a4f..."`, ajouter le prefixe produit un hash invalide qui fait echouer la validation Pydantic.
+
+**Contexte technique :** La fonction de hash doit etre appelee **une seule fois** sur le document normalise (apres suppression du champ `hash` s'il existe deja). Le hash resultant contient deja le prefixe canonique.
+
+---
+
+## Decision #25
+
+| Champ | Valeur |
+|---|---|
+| **Date** | 2026-07-16 |
+| **Sujet** | Elimination de `Severity.ERROR` dans `_phase_compare` |
+| **Statut** | **ACTIVE** |
+
+La classe `Severity` definie dans `core/base_collector.py` ne possede **que trois niveaux** :
+
+- `Severity.CRITICAL`
+- `Severity.WARNING`
+- `Severity.INFO`
+
+Il n'existe pas de niveau `Severity.ERROR`. La ligne suivante dans `core/pipeline.py` a l'interieur de `_phase_compare` cause une `AttributeError` :
+
+```python
+# Erreur — Severity n'a pas d'attribut ERROR
+elif change.severity == Severity.ERROR:
+
+# Correction — utiliser WARNING pour les changements de niveau erreur
+elif change.severity == Severity.WARNING:
+```
+
+Ou simplement supprimer ce bloc conditionnel si le comportement n'est pas souhaite.
+
+**Justification :** L'utilisation d'un attribut inexistant sur une classe Enum provoque une exception `AttributeError: type object 'Severity' has no attribute 'ERROR'` qui interrompt le pipeline.
+
+**Contexte technique :** Les changements detectes par `_phase_compare` sont classes dans les niveaux CRITICAL, WARNING ou INFO. Aucun changement ne devrait etre etiquette ERROR dans le cadre du projet AICollector.
+
+---
+
+## Decision #26
+
+| Champ | Valeur |
+|---|---|
+| **Date** | 2026-07-16 |
+| **Sujet** | Ordre de construction du document normalise dans `_phase_normalize` |
+| **Statut** | **ACTIVE** |
+
+Le hash d'un document doit etre calcule sur la **representation canonique** du document, c'est-a-dire **apres** que les champs variables (`timestamp_utc`, `hash`) aient ete normalises mais **avant** que le champ `hash` soit ajoute au document. L'ordre suivant est obligatoire :
+
+```python
+# 1. Nettoyer le document brut
+cleaned = _normalize_doc(doc)
+
+# 2. Supprimer le champ 'hash' s'il existe (sinon il pollue le hash)
+if "hash" in cleaned:
+    del cleaned["hash"]
+
+# 3. Uniformiser le timestamp (sans microsecondes)
+cleaned["timestamp_utc"] = timestamp_utc
+
+# 4. Calculer le hash sur le document nettoye
+doc_hash = compute_json_hash(cleaned)
+
+# 5. Ajouter le champ hash au document final
+cleaned["hash"] = doc_hash
+```
+
+**Justification :** Si le champ `hash` est inclus dans le document lors du calcul du hash, le hash resultant depend du hash lui-meme (dependance circulaire). Le hash doit etre calcule sur un document denue de toute metadonnee de hash.
+
+**Contexte technique :** Cette sequence est la seule qui garantisse un hash stable et reproductible conforme a la specification.
+
+---
+
+## Decision #27
+
+| Champ | Valeur |
+|---|---|
+| **Date** | 2026-07-16 |
+| **Sujet** | Suppression du prefixe `rootfs_` dans le nom du collecteur disk_usage |
+| **Statut** | **ACTIVE** |
+
+Le collecteur de l'utilisation disque a ete initialement concu sous le nom `rootfs_disk_usage` puis simplifie en `disk_usage`. Toutes les references au collecteur dans le code et la documentation doivent utiliser le nom canonique **sans prefixe** :
+
+- Nom du collecteur : `disk_usage`
+- Chemin du schema : `schemas/disk_usage.json`
+- Repertoire d'historique : `history/disk_usage/`
+- Cle dans `manifest.json` : `disk_usage`
+
+```python
+# Incorrect
+collector_name = "rootfs_disk_usage"
+
+# Correct
+collector_name = "disk_usage"
+```
+
+**Justification :** La coherence du nommage est essentielle pour que `_write_knowledge_json` et `_load_previous_state` puissent localiser les bons fichiers de schema et d'historique. Un nom incorrect provoque une `FileNotFoundError`.
+
+**Contexte technique :** Le nom du collecteur est derive du nom de la classe Python `DiskUsageCollector` par conversion en snake_case (`disk_usage`). Tout prefixe ajoute manuellement doit etre evite.
+
+---
+
+## Decision #28
+
+| Champ | Valeur |
+|---|---|
+| **Date** | 2026-07-16 |
+| **Sujet** | Creation automatique des repertoires de l'arborescence FHS |
+| **Statut** | **ACTIVE** |
+
+Le pipeline doit garantir que les repertoires de l'arborescence existent avant d'y ecrire des fichiers. Les repertoires suivants doivent etre crees au besoin :
+
+- `knowledge/` (repertoire racine de la base de connaissances)
+- `knowledge/<collector>/` (un sous-repertoire par collecteur)
+- `history/` (repertoire racine de l'historique)
+- `history/<collector>/` (un sous-repertoire par collecteur pour les snapshots)
+
+```python
+import os
+
+def _ensure_dir(path: str) -> None:
+    """Cree le repertoire s'il n'existe pas (y compris les parents)."""
+    os.makedirs(path, exist_ok=True)
+```
+
+```python
+# Repertoires a creer avant l'ecriture
+_ensure_dir(os.path.join(self.knowledge_dir, collector_name))
+_ensure_dir(os.path.join(self.history_dir, collector_name))
+```
+
+**Justification :** Si `knowledge/` ou `history/<collector>/` n'existent pas au premier lancement, `_write_knowledge_json` echoue avec `FileNotFoundError`. La creation proactive garantit un fonctionnement nominal des l'initialisation.
+
+**Contexte technique :** `os.makedirs(path, exist_ok=True)` est idempotent : appeler cette fonction sur un repertoire deja existant ne produit aucune erreur. Cette approche est preferee a `os.mkdir` qui echoue si le repertoire existe deja.
+
+
+*Derniere mise a jour : 2026-07-16*
