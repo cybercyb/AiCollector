@@ -29,13 +29,17 @@ ALLOWED_COMMANDS: Final[frozenset[str]] = frozenset({
     "sensors", "nproc", "hostname", "uname", "ls",
     "cat", "grep", "awk", "cut", "sort", "uniq",
     "wc", "find", "stat", "id", "whoami", "uptime",
-    "free", "mount", "ps", "netstat",
+    "free", "mount", "ps", "netstat", "dpkg-query", "apt",
 })
 
-# Arguments suspects qui pourraient être utilisés pour détourner une commande whitelistée
-DANGEROUS_ARG_PATTERNS: Final[frozenset[str]] = frozenset({
-    "-exec", "system", "eval", "sh", "bash", "python", "perl",
-    "nc", "ncat", "curl", "wget", ">", "<", "|", ";", "&&", "||"
+# Arguments suspects détectés par simple sous-chaîne (contient)
+DANGEROUS_SUBSTRING_PATTERNS: Final[frozenset[str]] = frozenset({
+    "-exec", "system", "eval", ">", "<", "|", ";", "&&", "||"
+})
+
+# Exécutables interdits détectés de manière exacte pour éviter les faux positifs (comme '--show')
+DANGEROUS_EXECUTABLE_NAMES: Final[frozenset[str]] = frozenset({
+    "sh", "bash", "python", "perl", "nc", "ncat", "curl", "wget"
 })
 
 
@@ -71,11 +75,21 @@ class SystemAdapter:
     def _validate_safe_args(self, cmd: str, args: list[str]) -> None:
         """Analyze arguments to prevent shell bypass/injection."""
         for arg in args:
-            # Recherche de patterns d'exécution système dans les arguments
             lower_arg = arg.lower()
-            if any(pattern in lower_arg for pattern in DANGEROUS_ARG_PATTERNS):
+
+            # 1. Validation des motifs par sous-chaîne
+            if any(pattern in lower_arg for pattern in DANGEROUS_SUBSTRING_PATTERNS):
                 logger.error(f"Security block: Dangerous argument pattern '{arg}' detected in command '{cmd}'")
                 raise ForbiddenCommandError(f"{cmd} (rejected due to unsafe argument: {arg})")
+
+            # 2. Validation exacte des binaires interdits (ex: 'sh' ou '/bin/sh')
+            is_forbidden_exe = (
+                lower_arg in DANGEROUS_EXECUTABLE_NAMES or
+                any(lower_arg.endswith("/" + exe) for exe in DANGEROUS_EXECUTABLE_NAMES)
+            )
+            if is_forbidden_exe:
+                logger.error(f"Security block: Forbidden executable '{arg}' passed as argument to command '{cmd}'")
+                raise ForbiddenCommandError(f"{cmd} (rejected due to unsafe executable argument: {arg})")
 
     def _assert_safe_path(self, path: Path, allowed_roots: list[Path]) -> None:
         """Ensure a file path is safe and restricted to whitelisted pseudo-filesystems."""
