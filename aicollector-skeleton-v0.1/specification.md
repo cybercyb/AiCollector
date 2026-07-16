@@ -1,10 +1,11 @@
+[SPECIFICATION V1.1.md](https://github.com/user-attachments/files/30080762/SPECIFICATION.V1.1.md)
 > **STATUT : VERSION FIGÉE ET VALIDÉE — Référence technique absolue du projet. Toute modification future doit d'abord être répercutée ici avant toute modification du code.**  
-> **Date de verrouillage :** 5 juillet 2026 — Version verrouillée par le client après revue complète.
+> **Date de verrouillage :** 2026-07-07 — Version Validée par le client après revue complète.
 
 # AICollector — Spécification Technique Complète
 
-**Version du document :** 1.0-draft  
-**Date :** 2026-07-03  
+**Version du document :** 1.1-draft  
+**Date :** 2026-07-07  
 **cible :** Python ≥ 3.12 · Ubuntu 26.04 LTS  
 
 ---
@@ -82,7 +83,7 @@ Le projet obéit à trois principes non négociables :
 
 - **Plateforme cible :** Ubuntu 26.04 LTS (Server) — les collecteurs utilisent des chemins Linux standards (`/proc`, `/sys`, `/var/lib/docker`, `/etc/systemd`, etc.)
 - **Python :** ≥ 3.12 (requis pour les dataclasses `slots=True`, `frozen`, la syntaxe moderne de type hinting)
-- **Dépendances externes :** Aucune dépendance Python externe obligatoire (stdlib only) — les dépendances optionnelles (pydantic, pyyaml) sont listées dans `requirements.txt` / `pyproject.toml`
+- **Dépendances externes :** `pydantic` (≥ 2.x) et `pyyaml` sont des **dépendances obligatoires**. Aucune autre dépendance Python externe n'est requise. Les dataclasses de transit (`CollectorResult`, `PipelineStats`, `Event`) restent en stdlib. Elles sont installées via `requirements.txt` / `pyproject.toml`.
 - **Permissions :** Lecture seule. Certains collecteurs nécessitent les droits root (accès `/proc/sys/kernel/ns_last_pid`, `/sys/block/*/device/smartctl/attributes`, etc.) — le comportement avec/sans root doit être géré proprement.
 - **Pas d'activité hors exécution :** Entre deux runs cron, le processus ne consume aucune ressource.
 
@@ -757,8 +758,13 @@ class AICollectorConfig(BaseModel):
 **Règles de validation :**
 
 - `retention.history_versions` doit être entre 1 et 1000
+- `retention.changes_entries` doit être entre 1 et 10 000
+- `retention.logs_days` doit être entre 1 et 365
 - `collectors.timeout_seconds` doit être entre 1 et 3600
-- `logging_level` doit être l'un des niveaux valides
+- `collectors.root_required_behavior` doit être l'un de : `skip`, `warn`, `fail`
+- `logging_level` doit être l'un des niveaux valides (DEBUG, INFO, WARNING, ERROR)
+- Tout champ manquant reçoit sa valeur par défaut déclarée dans le modèle Pydantic
+- Tout champ inattendu provoque une `ValidationError` (via `extra = "forbid"`)
 
 
 | Erreur | Cause | Comportement |
@@ -2329,7 +2335,8 @@ from pathlib import Path
 from typing import ClassVar
 
 # --- third party ---
-# Aucune dépendance obligatoire en V1 (stdlib only)
+from pydantic import BaseModel, Field, ConfigDict
+import yaml
 
 # --- local application ---
 from core.base_collector import BaseCollector
@@ -2441,7 +2448,7 @@ tests/
 - [ ] SystemAdapter avec whitelist de commandes et cache intra-run
 - [ ] EventBus synchrone in-process
 - [ ] Dataclasses de transit (`CollectorResult`, `PipelineStats`, `Event`)
-- [ ] Fichier `config.yaml` avec validation Pydantic
+- [x] Fichier `config.yaml` avec validation Pydantic
 - [ ] Lockfile avec détection de PID mort
 - [ ] Structure de répertoires (`knowledge/`, `changes/`, `history/`, `logs/`)
 
