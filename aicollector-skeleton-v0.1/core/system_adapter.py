@@ -285,3 +285,41 @@ class SystemAdapter:
         """Clear the intra-run cache. Called between runs."""
         self._cache.clear()
         self._file_cache.clear()
+    @staticmethod
+    def get_server_uuid(uuid_path: str | Path) -> str:
+        """Resolve, validate or generate a persistent UUIDv4 for the host.
+
+        Reads from the specified path. If the file is missing, empty, or contains
+        an invalid UUIDv4, a new one is generated, written with strict 0o600
+        permissions, and returned.
+        """
+        path = Path(uuid_path)
+        
+        # 1. Tentative de lecture et validation du UUID existant
+        if path.exists() and path.is_file():
+            try:
+                content = path.read_text(encoding="utf-8").strip()
+                # Validation stricte du format UUIDv4 via le module standard uuid
+                val = uuid.UUID(content)
+                if val.version == 4:
+                    return str(val)
+                logger.warning("UUID file %s contains an invalid UUID version (expected v4).", path)
+            except (ValueError, OSError) as exc:
+                logger.warning("Failed to read/validate UUID from %s: %s", path, exc)
+
+        # 2. Génération et écriture sécurisée (0o600) en cas d'absence ou d'invalidité
+        new_uuid = str(uuid.uuid4())
+        logger.info("Generating new persistent server UUID: %s", new_uuid)
+
+        try:
+            # S'assurer que le répertoire de destination existe
+            path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Utilisation de os.open pour garantir les permissions 0o600 dès la création du fichier (sans race condition de umask)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with open(fd, 'w', encoding='utf-8') as f:
+                f.write(new_uuid)
+        except Exception as exc:
+            logger.error("Could not write persistent server UUID to %s: %s", path, exc)
+
+        return new_uuid
