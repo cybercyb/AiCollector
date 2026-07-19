@@ -39,6 +39,7 @@ from core.exceptions import (
     AICollectorError,
     CollectorError,
     CollectorTimeoutError,
+    CollectorNotFoundError,
     PipelineError,
 )
 
@@ -84,7 +85,6 @@ class Pipeline:
         """Resolve and validate host's persistent server UUID via SystemAdapter."""
         try:
             # 1. Détermination résiliente du chemin du fichier d'UUID
-            # En tenant compte d'un chemin configuré (ex: config.paths.base_dir) ou du standard FHS
             uuid_path = "/var/lib/aicollector/.aicollector_uuid"
             
             if hasattr(self._config, "paths") and hasattr(self._config.paths, "base_dir"):
@@ -235,7 +235,6 @@ class Pipeline:
                 timestamp_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
                 # 2. Construction de l'enveloppe commune standardisée (sans hash initial)
-                # Utilisation de l'UUID persistant résolu par la Phase 0 (avec fallback sécurisé au cas où)
                 resolved_uuid = self._server_uuid or self._config.server_uuid or "00000000-0000-0000-0000-000000000000"
                 
                 normalized_doc = {
@@ -293,10 +292,18 @@ class Pipeline:
             if not previous_doc:
                 continue
             
+            # Résolution résiliente de la fonction de classification (robustesse aux collecteurs mockés)
+            classify_fn = None
+            try:
+                collector_instance = Registry.get_collector(name)
+                classify_fn = getattr(collector_instance, "classify_change", None)
+            except CollectorNotFoundError:
+                logger.debug("Collector '%s' not registered globally. Falling back to default change classification.", name)
+            
             raw_changes = self._diff_engine.compare(
                 old_data=previous_doc,
                 new_data=current_doc,
-                classify_fn=getattr(Registry.get_collector(name), "classify_change", None)
+                classify_fn=classify_fn
             )
             
             if not raw_changes:
@@ -311,8 +318,7 @@ class Pipeline:
             for change in raw_changes:
                 if change.severity == Severity.CRITICAL:
                     highest_severity = Severity.CRITICAL
-                    break
-                elif change.severity == Severity.WARNING:
+                elif change.severity == Severity.WARNING and highest_severity != Severity.CRITICAL:
                     highest_severity = Severity.WARNING
                 
                 serialized_changes.append({
@@ -366,7 +372,7 @@ class Pipeline:
             max_versions = getattr(self._config.retention, "history_versions", 50)
             
             # Recherche du paramètre de rétention pour les changements par alias probables
-            for attr in ("change_events", "changes_events", "changes", "max_changes", "keep_changes"):
+            for attr in ("change_events", "changes_events", "changes", "max_changes", "keep_changes", "changes_entries"):
                 if hasattr(self._config.retention, attr):
                     max_changes = getattr(self._config.retention, attr)
                     break
