@@ -212,6 +212,29 @@ class NetworkCollectorSchema(CommonSchema):
     capabilities: CollectorCapabilitiesSchema | None = None
 
 
+# ── Open Ports ────────────────────────────────────────────────────────────────
+
+class OpenPortEntry(BaseModel):
+    protocol: Literal["tcp", "udp"]
+    local_address: str
+    port: int
+    process: str | None = None
+    pid: int | None = None
+
+
+class PortsContent(BaseModel):
+    open_ports: list[OpenPortEntry] = Field(default_factory=list)
+    total_open_ports: int = 0
+
+
+@register_collector_schema("ports")
+class PortsCollectorSchema(CommonSchema):
+    """Schema for the listening ports collector."""
+    source: Literal["ports"] = "ports"
+    content: PortsContent
+    capabilities: CollectorCapabilitiesSchema | None = None
+
+
 # ── Docker ────────────────────────────────────────────────────────────────────
 
 class ContainerState(BaseModel):
